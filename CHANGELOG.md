@@ -7,6 +7,7 @@
 - A scheduled run keeps a plugged-in Mac awake until it ends. On battery the Mac is left to sleep and the run carries on at wake.
 - Fixed: in a scheduled run, the helper agents Claude starts could not hand their results back (each one was refused as a send).
 - Fixed: a scheduled run that was cut by a Mac sleep, recovered and finished was still marked as failed and run a second time.
+- Fixed: the model download now checks every file against its published SHA-256 before it is installed or extracted. A download cut short behind a normal response, an archive that does not extract or lacks a file, or a file that is not the published one now moves on to the next mirror (before, only timeouts and HTTP errors did). Mirrors are pinned to a commit, and a resumed download never continues another mirror's partial file. Thanks to @capitaharlock for the report.
 - Fixed: "Hey Mac, stop the other task" did nothing when the background services were installed (the voice daemon had no token for the backend).
 - A restart no longer loses the request in flight: the voice daemon and the chat backend pick a turn cut by a restart up again in the same session ("Back. Picking up where I left off."), if it was running within the last 30 minutes; older ones still ask.
 - Claude Code's own permission classifier runs on every tool call (`brain.permission_mode = "auto"`, the default); what it escalates is put to the user as a confirmation and passes once they say yes. `"bypassPermissions"` restores the previous behaviour.
