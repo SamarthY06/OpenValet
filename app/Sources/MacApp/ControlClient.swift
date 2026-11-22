@@ -3,7 +3,8 @@ import MacProtocol
 
 /// Client of ~/.mac-agent/run/control.sock (NDJSON, ARCHITECTURE.md §11).
 ///
-/// Events and replies are delivered on the main queue.
+/// Events and replies are delivered on the main queue. `onDaemonState` is the one exception:
+/// it runs on the reader thread, so what it drives never waits for the UI.
 final class ControlClient: @unchecked Sendable {
     typealias Reply = @MainActor @Sendable (_ ok: Bool, _ data: [String: Any], _ error: String?) -> Void
 
@@ -15,6 +16,10 @@ final class ControlClient: @unchecked Sendable {
 
     var onEvent: (@MainActor ([String: Any]) -> Void)?
     var onConnection: (@MainActor (Bool) -> Void)?
+    /// The daemon's state, the moment it is read from the socket (reader thread, in order, before
+    /// the main-queue hop); `.unknown` when the connection drops. Set once, before `start()`.
+    /// Audio decisions hang off this: a busy or stuck main thread must never delay them.
+    var onDaemonState: (@Sendable (AgentState) -> Void)?
 
     init(path: String = Paths.controlSock.path) {
         sock = UnixSocketClient(path: path, name: "control")
@@ -26,6 +31,7 @@ final class ControlClient: @unchecked Sendable {
         }
         sock.onDisconnect = { [weak self] in
             guard let self else { return }
+            self.onDaemonState?(.unknown)
             let pending = self.lock.withLock { () -> [Reply] in
                 defer { self.replies.removeAll() }
                 return Array(self.replies.values)
@@ -71,10 +77,11 @@ final class ControlClient: @unchecked Sendable {
     private func received(_ chunk: Data) {
         for line in lines.feed(chunk) {
             guard let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
-                Log.warn("control: bad JSON line: \(String(decoding: line.prefix(200), as: UTF8.self))", "control")
+                Log.warn("control: bad JSON line (\(line.count) bytes)", "control")  // never its text: it may be a transcript
                 continue
             }
-            if obj["event"] != nil {
+            if let event = obj["event"] as? String {
+                if event == "state" { onDaemonState?(AgentState(daemon: obj["state"] as? String)) }
                 let box = UncheckedBox(obj)
                 DispatchQueue.main.async { MainActor.assumeIsolated { self.onEvent?(box.value) } }
             } else if let id = obj["id"] as? String {

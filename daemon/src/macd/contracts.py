@@ -257,7 +257,7 @@ class ListenerEventKind(str, enum.Enum):
     UTTERANCE = "utterance"  # final transcript of one user utterance
     NO_SPEECH = "no_speech"  # woke / window opened but nothing was said before timeout
     FALSE_WAKE = "false_wake"  # KWS hit rejected by stage-2 verification (for metrics)
-    BARGE_IN = "barge_in"  # sustained user speech while Mac talks (AEC on): pause speech now;
+    BARGE_IN = "barge_in"  # the user's words heard while Mac talks (AEC on): pause speech now;
     # the verdict follows as UTTERANCE(window=SPEAKING) or NO_SPEECH(window=SPEAKING)
 
 
@@ -291,7 +291,9 @@ class Listener(Protocol):
     - While `speaking` is True and the output has no AEC, window/VAD capture is suppressed
       (wake word still works, with self-trigger suppression); only bare stop words come through.
     - While `speaking` is True with AEC, speech is captured as WindowReason.SPEAKING: BARGE_IN
-      after `listen.barge_in_onset_ms` of speech, then the transcript (or NO_SPEECH if empty).
+      once words are heard in it (`listen.barge_in_confirm`; off: after `listen.barge_in_onset_ms`
+      of any sound), then the transcript (or NO_SPEECH if empty). A capture that never paused Mac
+      still ends in one of those two.
     - A TURN window stays open across utterances until closed or replaced.
     """
 

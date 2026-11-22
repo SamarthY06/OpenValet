@@ -34,9 +34,12 @@ final class AudioEngine: @unchecked Sendable {
     private var poweredOff = false  // "Turn Off": engine released until turned on
     /// Voice processing (AEC/NS) costs ~18 % of a core by itself (Apple's BNNS model runs
     /// in-process), so it is only enabled while a turn is in progress: see
-    /// `setVoiceProcessingWanted`. Idle = plain input ≈ 0.5 %.
+    /// `daemonStateChanged`. Idle = plain input ≈ 0.5 %.
     private var vpWanted = false
     private var vpActive = false
+    /// The daemon's last state and the pending "AEC off after a quiet minute" (see `daemonStateChanged`).
+    private var lastDaemonState: AgentState = .unknown
+    private var aecOffTimer: DispatchWorkItem?
     /// PLAY/END that arrive while the engine is being rebuilt (≈0.3–0.5 s): replayed
     /// in order once it is up, so a filler like "Okay." sent at `thinking` isn't dropped.
     private var deferred: [AudioMessage] = []
@@ -66,9 +69,14 @@ final class AudioEngine: @unchecked Sendable {
         var ended = false
         var pending = 0
     }
-    private struct Scheduled { let token: UInt64; let stream: UInt32 }
+    /// Buffers handed to the player, oldest first; one leaves when it has been played.
+    private struct Scheduled { let token: UInt64; let stream: UInt32; let buffer: AVAudioPCMBuffer }
     private var streams: [UInt32: Stream] = [:]
     private var scheduled: [Scheduled] = []
+    /// Speech that was scheduled but not yet heard when the engine was rebuilt (the AEC switch;
+    /// at a device change, whatever is still queued): put back on the new player, so a rebuild
+    /// is a short gap and not lost words.
+    private var carried: [(stream: UInt32, buffer: AVAudioPCMBuffer)] = []
     private var nextToken: UInt64 = 1
     private var closedStreams = RecentSet(capacity: 512)  // drained or flushed: ignore late PLAY
 
@@ -146,17 +154,53 @@ final class AudioEngine: @unchecked Sendable {
         }
     }
 
-    /// CPU policy: AEC is needed only while Mac may be speaking. Called by `Power` on
-    /// every daemon state change; a change of mind rebuilds the engine (not at wake →
-    /// listening, so the words right after "Hey Mac" are never lost).
-    func setVoiceProcessingWanted(_ on: Bool) {
+    /// The daemon's state, straight from the control socket's reader thread (any thread; applied
+    /// in order on `queue`). It must not go through the main thread: a slow UI would switch echo
+    /// cancelling on late, so Mac hears itself and the late rebuild interrupts the answer.
+    ///
+    /// CPU policy: AEC is needed only while Mac may speak. On from `thinking` onwards, kept through
+    /// FOLLOWUP and for 60 s after the turn ends (people follow up), then off. Never toggled at
+    /// `listening` (a rebuild there would eat the words after "Hey Mac"). Each toggle is an engine
+    /// rebuild, so this keeps rebuilds to about one per conversation.
+    func daemonStateChanged(_ state: AgentState) {
         queue.async { [self] in
-            guard vpWanted != on else { return }
-            vpWanted = on
-            guard wantRunning, engine != nil, vpActive != (on && preferVoiceProcessing) else { return }
-            Log.info("voice processing \(on ? "on" : "off") (state change) → rebuilding engine", "audio")
-            buildAndStart(reason: on ? "AEC on for turn" : "AEC off (idle)")
+            switch state {
+            case .thinking, .speaking, .confirming, .followup:
+                aecOffTimer?.cancel(); aecOffTimer = nil
+                setVoiceProcessingWanted(true, why: state.rawValue)
+            case .idle:
+                // A quiet minute before dropping AEC (env MAC_AEC_IDLE_S overrides; e2e uses 3). A
+                // timer that is already running is kept: a false wake does not push it out.
+                if vpWanted, aecOffTimer == nil {
+                    let delay = Double(Paths.env["MAC_AEC_IDLE_S"] ?? "").flatMap { $0.isFinite && $0 >= 0 ? $0 : nil } ?? 60
+                    let w = DispatchWorkItem { [self] in
+                        aecOffTimer = nil  // not while listening: the next idle starts the minute again
+                        if lastDaemonState == .idle { setVoiceProcessingWanted(false, why: String(format: "idle for %g s", delay)) }
+                    }
+                    aecOffTimer = w
+                    queue.asyncAfter(deadline: .now() + delay, execute: w)
+                }
+            case .off:
+                // `setPowered(false)` releases the engine; a rebuild first would only reopen the mic.
+                aecOffTimer?.cancel(); aecOffTimer = nil
+                vpWanted = false
+            case .unknown, .error:
+                aecOffTimer?.cancel(); aecOffTimer = nil
+                setVoiceProcessingWanted(false, why: state.rawValue)
+            case .listening: break
+            }
+            lastDaemonState = state
         }
+    }
+
+    /// On `queue`. A change of mind rebuilds the engine; speech already scheduled is carried over.
+    /// While an engine start is being retried nothing is rebuilt: each attempt reads `vpWanted`.
+    private func setVoiceProcessingWanted(_ on: Bool, why: String) {
+        guard vpWanted != on else { return }
+        vpWanted = on
+        guard wantRunning, engine != nil, vpActive != (on && preferVoiceProcessing) else { return }
+        if on, let failed = vpFailedForDevice, failed == CoreAudioDevices.defaultInput().map(CoreAudioDevices.name) { return }
+        buildAndStart(reason: "AEC \(on ? "on" : "off"): \(why)")
     }
 
     /// Synchronous shutdown for app termination.
@@ -205,6 +249,7 @@ final class AudioEngine: @unchecked Sendable {
         engine = nil
         player = nil
         playerFormat = nil
+        for sid in Array(streams.keys) { streams[sid]?.converter = nil }  // the next engine may run at another rate
         vpActive = false
         micConverter = nil
         micInFormat = nil
@@ -219,22 +264,27 @@ final class AudioEngine: @unchecked Sendable {
     /// while CoreAudio reconfigures) or -10868. Strategy (never leave the mic dead):
     ///   1. retry with a FRESH engine every 250 ms, up to 8× (≈2 s);
     ///   2. then fall back to the previous configuration (VP toggled back) with the same retries;
-    ///   3. only then wait 5 s and start over. Deferred PLAY/END survive all of this.
+    ///   3. only then wait 5 s and start over. Deferred PLAY/END survive all of this, and so does
+    ///      speech that was already scheduled (`carryUnplayed`).
     private func buildAndStart(reason: String) {
-        flushAll(reason: "engine rebuild")
+        carryUnplayed(reason: reason)
         teardown()
         startAttempts = 0
-        attemptStart(reason: reason, voiceProcessing: preferVoiceProcessing && vpWanted, fallbackTried: false)
+        attemptStart(reason: reason, fallback: false)
     }
 
-    private func attemptStart(reason: String, voiceProcessing wantVP: Bool, fallbackTried: Bool) {
+    /// `fallback`: start with voice processing the other way round from what is wanted. What is
+    /// wanted is read at every attempt, so a turn that begins during the retries still gets AEC.
+    private func attemptStart(reason: String, fallback: Bool) {
         guard wantRunning, engine == nil else { return }
         let pinned = preferBuiltInMic && startAttempts == 0 ? pinBuiltInMicIfOnBluetooth() : nil
         let defaultName = CoreAudioDevices.defaultInput().map(CoreAudioDevices.name) ?? "none"
+        let wantVP = (preferVoiceProcessing && vpWanted) != fallback
         let tryVP = wantVP && vpFailedForDevice != defaultName
         do {
             try startEngine(voiceProcessing: tryVP, reason: reason + (startAttempts > 0 ? " (attempt \(startAttempts + 1))" : ""), note: pinned)
             startAttempts = 0
+            resumeCarried()
             replayDeferred()
         } catch {
             teardown()
@@ -242,16 +292,16 @@ final class AudioEngine: @unchecked Sendable {
             failedStarts += 1
             Log.warn("engine start failed (vp=\(tryVP), attempt \(startAttempts)): \(error)", "audio")
             if startAttempts < 8 {
-                queue.asyncAfter(deadline: .now() + 0.25) { [self] in attemptStart(reason: reason, voiceProcessing: wantVP, fallbackTried: fallbackTried) }
-            } else if !fallbackTried {
+                queue.asyncAfter(deadline: .now() + 0.25) { [self] in attemptStart(reason: reason, fallback: fallback) }
+            } else if !fallback {
                 // Give up on this configuration: go back to the one that worked.
                 if tryVP { vpFailedForDevice = defaultName }
                 Log.warn("falling back to the previous configuration (vp=\(!wantVP))", "audio")
                 startAttempts = 0
-                queue.asyncAfter(deadline: .now() + 0.25) { [self] in attemptStart(reason: reason + " fallback", voiceProcessing: !wantVP, fallbackTried: true) }
+                queue.asyncAfter(deadline: .now() + 0.25) { [self] in attemptStart(reason: reason + " fallback", fallback: true) }
             } else {
                 setHello(Hello(input_device: "none", aec: false), error: "Audio engine failed: \(error.localizedDescription)")
-                dropDeferred(reason: "engine failed")
+                flushAll(reason: "engine failed")  // carried and deferred speech: DRAINED, the daemon moves on
                 startAttempts = 0
                 queue.asyncAfter(deadline: .now() + 5) { [self] in
                     if wantRunning && engine == nil { buildAndStart(reason: "retry") }
@@ -537,11 +587,42 @@ final class AudioEngine: @unchecked Sendable {
         AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false)!
     }
 
+    /// Before a rebuild: keep what was scheduled but not yet heard. A buffer leaves `scheduled`
+    /// when it has been played, so what is left is the one in progress and those after it. The
+    /// one in progress is played again from its start: the daemon's PLAY chunks are 0.1 s, so
+    /// that is a short repeat and never a lost word. The streams stay open; `resumeCarried` puts
+    /// the audio back.
+    private func carryUnplayed(reason: String) {
+        guard !scheduled.isEmpty else { return }
+        let kept = scheduled.filter { streams[$0.stream] != nil }
+        carried += kept.map { ($0.stream, $0.buffer) }
+        scheduled.removeAll()
+        for sid in Array(streams.keys) { streams[sid]?.pending = 0 }
+        let seconds = kept.reduce(0.0) { $0 + Double($1.buffer.frameLength) / $1.buffer.format.sampleRate }
+        Log.info(String(format: "carried %.2f s of speech over the rebuild (%@)", seconds, reason), "audio")
+    }
+
+    /// After a rebuild: carried speech first, in its old order; PLAY/END that arrived meanwhile
+    /// follow (`replayDeferred`).
+    private func resumeCarried() {
+        guard let p = player, let pFmt = playerFormat else { return }
+        let items = carried.filter { streams[$0.stream] != nil }
+        carried.removeAll()
+        // The new engine may run at another rate: one converter for the whole carry (no seams).
+        let conv = items.first.flatMap { $0.buffer.format == pFmt ? nil : AVAudioConverter(from: $0.buffer.format, to: pFmt) }
+        for (sid, b) in items {
+            var out: AVAudioPCMBuffer? = b
+            if let conv { out = convert(b, with: conv, to: pFmt, endOfStream: false) }
+            if let out, out.frameLength > 0 { schedule(out, stream: sid, on: p) }
+        }
+        for sid in Array(streams.keys) { checkDrained(sid) }  // ended and nothing left to play
+    }
+
     private func schedule(_ b: AVAudioPCMBuffer, stream sid: UInt32, on p: AVAudioPlayerNode) {
         let token = nextToken
         nextToken &+= 1
         let gen = generation
-        scheduled.append(Scheduled(token: token, stream: sid))
+        scheduled.append(Scheduled(token: token, stream: sid, buffer: b))
         streams[sid]?.pending += 1
         p.scheduleBuffer(b, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             guard let self else { return }
@@ -598,12 +679,18 @@ final class AudioEngine: @unchecked Sendable {
 
     /// Stop all playback immediately and report every open stream as DRAINED.
     private func flushAll(reason: String) {
-        if !deferred.isEmpty && reason != "engine rebuild" { dropDeferred(reason: reason) }
+        dropDeferred(reason: reason)
         let open = Array(streams.keys)
-        scheduled.removeAll()
-        player?.stop()
+        stopPlayback()
         for sid in open { finish(sid) }
         if !open.isEmpty { Log.info("flushed streams \(open) (\(reason))", "audio") }
+    }
+
+    /// Silence now: nothing queued for the player, or waiting for the next one, is ever heard.
+    private func stopPlayback() {
+        scheduled.removeAll()
+        carried.removeAll()
+        player?.stop()
     }
 }
 
@@ -616,8 +703,8 @@ extension AudioEngine: AudioLinkDelegate {
 
     func audioLinkDidDisconnect() {
         // Daemon went away: nothing will ever be flushed/ended → stop playback silently.
-        scheduled.removeAll()
-        player?.stop()
+        stopPlayback()
+        deferred.removeAll(); deferredBytes = 0
         streams.removeAll()
     }
 

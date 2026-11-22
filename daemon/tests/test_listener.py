@@ -299,7 +299,10 @@ async def test_wake_instrumentation_events_and_counters():
     lis = ListenerImpl(src, FakeWake(int(1.6 * SAMPLE_RATE)), FakeVAD(), FakeSTT("big mac"), Config(), eventlog=sink)
     lis.set_speaking(True, "I'm Mac")
     await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 10)
-    assert [t for t, _ in sink.events] == ["kws_hit", "wake_suppressed"] and sink.events[1][1]["reason"] == "self_trigger"
+    # (the last one: the stop-word capture of Mac's own voice, no echo cancellation)
+    assert [t for t, _ in sink.events] == ["kws_hit", "wake_suppressed", "barge_capture"]
+    assert sink.events[1][1]["reason"] == "self_trigger"
+    assert sink.events[2][1]["aec"] is False and sink.events[2][1]["paused"] is False and sink.events[2][1]["probes"] == 0
     assert lis.metrics.counters["wakes_suppressed"] == 1
 
 
@@ -323,29 +326,301 @@ def _speaking_aec(text="Here is a long answer about the weather"):
     return lambda l: (setattr(l, "_aec", True), l.set_speaking(True, text))
 
 
-async def test_barge_in_with_aec_pauses_then_passes_any_words():
-    """With AEC, speech over Mac emits BARGE_IN after barge_in_onset_ms, then the full transcript
-    (the orchestrator decides what it means); an empty transcript is a NO_SPEECH verdict."""
-    kinds, events, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=FakeSTT("what about tomorrow"),
-                                   before=_speaking_aec())
+def _pause_times(lis):
+    """Records the stream time (s) of every BARGE_IN as it is put on the listener's queue."""
+    times, put = [], lis._queue.put_nowait
+
+    def record(ev):
+        if ev is not None and ev.kind is K.BARGE_IN:
+            times.append(lis._pos / SAMPLE_RATE)
+        put(ev)
+
+    lis._queue.put_nowait = record
+    return times
+
+
+class GateSTT(FakeSTT):
+    """The first ``hold`` calls wait for ``release``; ``texts`` are returned in call order (then
+    the last one). ``started`` is set once the first call is waiting."""
+
+    def __init__(self, *texts: str, hold: int = 1) -> None:
+        super().__init__()
+        self.texts, self.hold, self.n = list(texts), hold, 0
+        self.release, self.started = asyncio.Event(), asyncio.Event()
+
+    async def transcribe(self, pcm):
+        i, self.n = self.n, self.n + 1
+        self.calls.append(len(pcm) / SAMPLE_RATE)
+        if i < self.hold:
+            self.started.set()
+            await self.release.wait()
+        else:
+            await asyncio.sleep(0)
+        return self.texts[min(i, len(self.texts) - 1)]
+
+
+async def test_barge_in_with_aec_pauses_on_words_then_passes_any_words():
+    """With AEC, speech over Mac emits BARGE_IN once a probe hears words in it (it starts after
+    barge_in_onset_ms of speech), then the full transcript (the orchestrator decides what it
+    means); an empty transcript is a NO_SPEECH verdict."""
+    times, stt = [], FakeSTT("what about tomorrow")
+    kinds, events, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=stt,
+                                   before=lambda l: (_speaking_aec()(l), times.append(_pause_times(l))))
     assert kinds == [K.BARGE_IN, K.UTTERANCE]
     assert events[0].window is WindowReason.SPEAKING
     u = events[1].utterance
     assert u.window is WindowReason.SPEAKING and u.text == "what about tomorrow" and not u.woke
-    # onset: 300 ms of speech, so a 200 ms click never pauses Mac
-    kinds, _, _ = await run(audio((1.0, 1.2)), wake_at=None, stt=FakeSTT(""), before=_speaking_aec())
-    assert K.BARGE_IN not in kinds
-    # words heard as nothing (cough): the verdict is NO_SPEECH so Mac resumes
-    kinds, events, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=FakeSTT(""), before=_speaking_aec())
-    assert kinds == [K.BARGE_IN, K.NO_SPEECH] and events[1].window is WindowReason.SPEAKING
-    # no STT model: also a NO_SPEECH verdict (never stuck paused)
+    # the probe starts at 1.3 s (300 ms of speech) and reads the capture so far: 0.3 s lead-in + 0.3 s
+    assert len(stt.calls) == 2 and stt.calls[0] == pytest.approx(0.6)
+    assert times[0] == [pytest.approx(1.3 + 0.06)]  # its answer is applied three frames later
+    # onset: 300 ms of speech, so a 200 ms click is never even probed
+    stt = FakeSTT("")
+    kinds, _, _ = await run(audio((1.0, 1.2)), wake_at=None, stt=stt, before=_speaking_aec())
+    assert K.BARGE_IN not in kinds and len(stt.calls) == 1
+    # no STT model: the old rule (pause on the sound), and a NO_SPEECH verdict (never stuck paused)
     kinds, _, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=FakeSTT(missing=True), before=_speaking_aec())
     assert kinds == [K.BARGE_IN, K.NO_SPEECH]
 
 
+async def test_a_sound_without_words_over_mac_never_pauses_it():
+    """Live 14 to 18 Nov: most pauses were false alarms that resumed with "no words", each a gap
+    of 0.6 to 2 s. A cough, a door, a fan: probed, nothing heard, no BARGE_IN; the verdict is
+    still NO_SPEECH. Probes thin out (400 ms of sound after the first, then 800, then 1600)."""
+    stt = FakeSTT("")
+    kinds, events, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=stt, before=_speaking_aec())
+    assert kinds == [K.NO_SPEECH] and events[0].window is WindowReason.SPEAKING
+    stt = FakeSTT("")
+    kinds, _, _ = await run(audio((1.0, 6.0), total_s=8.0), wake_at=None, stt=stt, before=_speaking_aec())
+    assert kinds == [K.NO_SPEECH]
+    # probes after 0.3, 0.7, 1.5, 3.1 and 4.7 s of sound, each on at most the last 4 s; then the final pass
+    assert stt.calls[:-1] == pytest.approx([0.6, 1.0, 1.8, 3.4, 4.0])
+    assert stt.calls[-1] > 5.0
+
+
+async def test_a_backchannel_over_mac_does_not_pause_it_but_words_after_it_do():
+    """ "Yeah" while Mac talks is following along: no pause (the transcript still goes out and the
+    orchestrator drops it). "Yeah, but wait" is an interruption once the words are there."""
+    kinds, events, _ = await run(audio((1.0, 1.6)), wake_at=None, stt=FakeSTT("mm-hmm"), before=_speaking_aec())
+    assert kinds == [K.UTTERANCE] and events[0].utterance.window is WindowReason.SPEAKING
+    stt = SeqSTT("yeah", "yeah but wait", "yeah but wait that is wrong")
+    kinds, events, _ = await run(audio((1.0, 3.0)), wake_at=None, stt=stt, before=_speaking_aec())
+    assert kinds == [K.BARGE_IN, K.UTTERANCE] and events[1].utterance.text == "yeah but wait that is wrong"
+
+
+async def test_one_or_two_words_do_not_pause_mac_until_more_follow():
+    """Half a second of noise or leaked echo often transcribes as "So" or "You're": too little to
+    stop Mac for. The start of a sentence is heard again 200 ms later; "stop" and "wait" need no more."""
+    times, stt = [], SeqSTT("can you", "can you repeat", "can you repeat that")
+    kinds, events, _ = await run(audio((1.0, 3.0)), wake_at=None, stt=stt,
+                                   before=lambda l: (_speaking_aec()(l), times.append(_pause_times(l))))
+    assert kinds == [K.BARGE_IN, K.UTTERANCE] and events[1].utterance.text == "can you repeat that"
+    assert times[0] == [pytest.approx(1.5 + 0.06)]  # the probe after 200 ms more speech
+    kinds, events, _ = await run(audio((1.0, 3.0)), wake_at=None, stt=FakeSTT("you're"), before=_speaking_aec())
+    assert kinds == [K.UTTERANCE]  # never paused; the orchestrator drops it as too short
+    # Mac's own words with one stray one are still its echo, cut off mid-word
+    kinds, _, _ = await run(audio((1.0, 3.0)), wake_at=None, stt=FakeSTT("here it is"),
+                            before=_speaking_aec("Here is what I found about the weather."))
+    assert kinds == [K.UTTERANCE]
+    for word in ("stop", "wait", "okay stop please", "hold on"):
+        times = []
+        kinds, _, _ = await run(audio((1.0, 1.6)), wake_at=None, stt=FakeSTT(word),
+                                before=lambda l, times=times: (_speaking_aec()(l), times.append(_pause_times(l))))
+        assert kinds == [K.BARGE_IN, K.UTTERANCE] and times[0] == [pytest.approx(1.3 + 0.06)], word
+
+
+async def test_words_after_an_empty_probe_pause_mac_once():
+    """ "Uh" (nothing heard) and then words: the second probe hears them. One BARGE_IN only."""
+    times, stt = [], SeqSTT("", "wait that is", "wait that is wrong")
+    kinds, events, _ = await run(audio((1.0, 3.0)), wake_at=None, stt=stt,
+                                   before=lambda l: (_speaking_aec()(l), times.append(_pause_times(l))))
+    assert kinds == [K.BARGE_IN, K.UTTERANCE] and events[1].utterance.text == "wait that is wrong"
+    assert times[0] == [pytest.approx(1.7 + 0.06)]  # the probe after 400 ms more speech
+    assert len(stt.calls) == 3  # nothing is probed once Mac has paused
+
+
+async def test_macs_own_words_leaking_through_do_not_pause_it():
+    """Echo that the canceller let through transcribes as what Mac is saying: not an interruption.
+    The last two items count (an echo trails the audio), and real words later still pause."""
+    said = "Here is a long answer about the weather"
+    kinds, _, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=FakeSTT("a long answer about the weather"),
+                            before=_speaking_aec(said))
+    assert kinds == [K.UTTERANCE]  # the orchestrator's own echo rule handles the transcript
+
+    def two_items(l):
+        _speaking_aec(said)(l)
+        l.set_speaking(True, "and tomorrow looks dry")  # the echo of the first sentence is still arriving
+
+    kinds, _, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=FakeSTT("answer about the weather"), before=two_items)
+    assert kinds == [K.UTTERANCE]
+    stt = SeqSTT("long answer", "long answer no stop that", "long answer no stop that is wrong")
+    kinds, _, _ = await run(audio((1.0, 3.0)), wake_at=None, stt=stt, before=_speaking_aec(said))
+    assert kinds == [K.BARGE_IN, K.UTTERANCE]
+
+
+async def test_a_capture_that_ends_while_its_probe_is_running_does_not_pause_late():
+    """Live audio does not wait for a probe. If the capture is finalised first, the late answer is
+    dropped: the transcript alone goes to the orchestrator (which handles it without a pause)."""
+    stt = GateSTT("stop that", "stop that")
+
+    def live(l):
+        _speaking_aec()(l)
+        l._probe_wait = False  # as with the microphone
+        orig = l._on_frame
+
+        async def frame(f):
+            await orig(f)
+            if l._capture is None and stt.started.is_set():
+                stt.release.set()  # the probe answers only after the capture is over
+
+        l._on_frame = frame
+
+    kinds, events, lis = await run(audio((1.0, 1.5)), wake_at=None, stt=stt, before=live)
+    assert kinds == [K.UTTERANCE] and events[0].utterance.window is WindowReason.SPEAKING
+    assert stt.n == 2 and not lis._jobs  # the probe did finish; its answer was not used
+
+
+async def test_a_probe_answer_is_dropped_when_mac_stopped_speaking_or_the_listener_was_muted():
+    for change in (lambda l: l.set_speaking(False), lambda l: l.set_muted(True)):
+        stt = GateSTT("stop that", "stop that")
+
+        def live(l, change=change, stt=stt):
+            _speaking_aec()(l)
+            l._probe_wait = False
+            orig = l._on_frame
+
+            async def frame(f):
+                await orig(f)
+                if stt.started.is_set() and not stt.release.is_set():
+                    change(l)
+                    stt.release.set()
+
+            l._on_frame = frame
+
+        kinds, _, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=stt, before=live)
+        assert K.BARGE_IN not in kinds, kinds
+
+
+async def test_live_audio_pauses_when_the_probe_answers_without_holding_up_frames():
+    """With a paced source the frame path never waits for STT: frames keep flowing while the probe
+    runs, and BARGE_IN goes out on the first frame after its answer."""
+    stt = GateSTT("stop that", "stop that right now")
+    times = []
+
+    def live(l):
+        _speaking_aec()(l)
+        l._probe_wait = False
+        times.append(_pause_times(l))
+        orig = l._on_frame
+
+        async def frame(f):
+            await orig(f)
+            if l._pos == int(1.8 * SAMPLE_RATE):
+                stt.release.set()  # a slow probe: half a second
+
+        l._on_frame = frame
+
+    kinds, _, lis = await run(audio((1.0, 3.0)), wake_at=None, stt=stt, before=live)
+    assert kinds == [K.BARGE_IN, K.UTTERANCE]
+    assert 1.8 < times[0][0] <= 1.86 and len(times[0]) == 1
+    assert stt.n == 2  # one probe in flight at a time: none was started while the first one ran
+    assert lis.frame_ms_max < 20
+
+
+def _at(l, *steps):
+    """Runs each (time_s, fn) once, right after the frame that ends at that stream time."""
+    todo, orig = list(steps), l._on_frame
+
+    async def frame(f):
+        await orig(f)
+        while todo and l._pos >= round(todo[0][0] * SAMPLE_RATE):
+            todo.pop(0)[1](l)
+
+    l._on_frame = frame
+
+
+async def test_mac_starting_an_item_into_an_open_capture_asks_stt_at_once():
+    """An item that starts while a capture with speech is open (the user paused to think) is
+    probed right then, not after another 300 ms of speech: words pause Mac within a few frames
+    of its first sound; a capture that holds only noise does not pause it at all."""
+    def before(times, sink):
+        return lambda l: (setattr(l, "_aec", True), setattr(l, "eventlog", sink), l.open_window(3600, WindowReason.TURN),
+                          times.append(_pause_times(l)),
+                          _at(l, (2.4, lambda l: l.set_speaking(True, "The best people to connect with"))))
+
+    times, sink = [], EventSink()
+    kinds, events, _ = await run(audio((1.0, 2.0), (2.6, 3.4)), wake_at=None, turn=FakeTurn(0.05, 0.9),
+                                   stt=FakeSTT("you can get my profile from the resume folder"), before=before(times, sink))
+    assert kinds == [K.SPEECH_START, K.BARGE_IN, K.UTTERANCE] and events[-1].utterance.window is WindowReason.SPEAKING
+    assert 2.4 < times[0][0] <= 2.48 and len(times[0]) == 1  # before the user's next word at 2.6 s
+    (ev,) = [f for t, f in sink.events if t == "barge_capture"]
+    assert ev["began"] == "item_start" and ev["paused"] and ev["probes"] == 1 and 40 <= ev["pause_after_ms"] <= 80
+
+    times, stt = [], FakeSTT("")
+    kinds, _, _ = await run(audio((1.0, 2.0), (2.6, 3.4)), wake_at=None, turn=FakeTurn(0.05, 0.9), stt=stt,
+                              before=before(times, EventSink()))
+    assert kinds == [K.SPEECH_START, K.NO_SPEECH] and times[0] == []
+    assert stt.calls[0] == pytest.approx(1.7, abs=0.05)  # probed at 2.4 s: the capture since 0.7 s
+
+
+async def test_an_unconfirmed_barge_capture_is_probed_again_when_the_next_item_starts():
+    """Mac's sentence ends while the first probe is still running (its answer is dropped: nothing
+    to pause), the user pauses, and the next sentence starts into that pause."""
+    stt, times = GateSTT("so", "so what about", "so what about tomorrow"), []
+
+    def before(l):
+        _speaking_aec()(l)
+        l._probe_wait = False
+        times.append(_pause_times(l))
+        _at(l, (1.4, lambda l: l.set_speaking(False)), (1.44, lambda l: stt.release.set()),
+            (2.0, lambda l: l.set_speaking(True, "It will rain in the morning")))
+
+    kinds, _, _ = await run(audio((1.0, 1.5), (2.6, 3.0)), wake_at=None, stt=stt, turn=FakeTurn(0.05, 0.9), before=before)
+    assert kinds == [K.BARGE_IN, K.UTTERANCE]
+    assert 2.0 < times[0][0] <= 2.1 and len(times[0]) == 1
+
+
+async def test_every_speaking_capture_logs_its_numbers_and_never_any_text():
+    sink = EventSink()
+    stt = SeqSTT("", "wait that is", "wait that is wrong")
+    await run(audio((1.0, 3.0)), wake_at=None, stt=stt, before=lambda l: (_speaking_aec()(l), setattr(l, "eventlog", sink)))
+    (ev,) = [f for t, f in sink.events if t == "barge_capture"]
+    assert {k for k, v in ev.items() if isinstance(v, str)} == {"source", "began"}  # the rest are numbers, flags
+    assert set(ev["probe_heard"]) <= {"none", "echo", "backchannel", "few", "words"}  # and categories, never the words
+    assert ev.pop("probe_ms") >= 0
+    assert ev == {
+        "source": "file", "aec": True, "barge": True, "paused": True, "began": "onset",
+        "capture_ms": 3000,  # 0.3 s lead-in, 2 s of speech, 0.7 s of silence
+        "voiced_ms": 2000, "vad_max": 1.0, "vad_mean": pytest.approx(0.73, abs=0.02),
+        "peak_dbfs": -6.0, "rms_dbfs": pytest.approx(-7.2, abs=0.1),
+        "probes": 2, "probe_heard": ["none", "words"],
+        "pause_after_ms": 760,  # second probe after 0.7 s of speech, applied 60 ms later
+        "words": 4,
+    }
+    # a sound with no words, and a capture without echo cancellation: still one event each
+    sink = EventSink()
+    await run(audio((1.0, 1.5)), wake_at=None, stt=FakeSTT(""), before=lambda l: (_speaking_aec()(l), setattr(l, "eventlog", sink)))
+    (ev,) = [f for t, f in sink.events if t == "barge_capture"]
+    assert not ev["paused"] and ev["pause_after_ms"] is None and ev["words"] == 0 and ev["probes"] == 1
+    sink = EventSink()
+    await run(np.zeros(SAMPLE_RATE * 2, np.float32), wake_at=None, before=lambda l: (_speaking_aec()(l), setattr(l, "eventlog", sink)))
+    assert sink.events == []  # no capture, no event
+
+
+async def test_barge_in_confirm_off_pauses_on_the_onset_as_before():
+    cfg = Config()
+    cfg.listen.barge_in_confirm = False
+    times, stt = [], FakeSTT("")
+    kinds, events, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=stt, cfg=cfg,
+                                   before=lambda l: (_speaking_aec()(l), times.append(_pause_times(l))))
+    assert kinds == [K.BARGE_IN, K.NO_SPEECH] and events[1].window is WindowReason.SPEAKING
+    assert times[0] == [pytest.approx(1.3)] and len(stt.calls) == 1  # at 300 ms of sound, nothing probed
+    kinds, _, _ = await run(audio((1.0, 1.2)), wake_at=None, stt=FakeSTT(""), cfg=cfg, before=_speaking_aec())
+    assert K.BARGE_IN not in kinds
+
+
 async def test_barge_in_capture_is_a_full_utterance_and_survives_playback_end():
     # 3 s of talking over Mac is one utterance (not cut at the 2 s stop-word cap)
-    kinds, events, _ = await run(audio((1.0, 4.0)), wake_at=None, stt=FakeSTT("long reply"), before=_speaking_aec())
+    kinds, events, _ = await run(audio((1.0, 4.0)), wake_at=None, stt=FakeSTT("tell me something else"), before=_speaking_aec())
     assert kinds == [K.BARGE_IN, K.UTTERANCE] and events[1].utterance.audio_s > 3.0
 
     def stop_mid(l):

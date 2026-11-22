@@ -29,6 +29,7 @@ final class StatusBar: NSObject, NSMenuDelegate {
     private let actions: Actions
     private let overlay = PassthroughImageView()
     private var shown: (glyph: String, animated: Bool)?
+    private var shownLabel: String?
     private var bounceReset: DispatchWorkItem?
 
     init(model: AppModel, actions: Actions) {
@@ -74,9 +75,15 @@ final class StatusBar: NSObject, NSMenuDelegate {
         let glyph = model.glyph
         let off = model.off
         let animated = !off && !model.muted && model.state.isActive && !UX.reduceMotion
-        b.alphaValue = off ? 0.45 : 1
-        b.setAccessibilityLabel("Mac: \(model.statusLine)")
-        b.toolTip = "Mac: \(model.statusLine)"
+        // Called on every daemon event: touch the status item only when something changed.
+        let alpha: CGFloat = off ? 0.45 : 1
+        if b.alphaValue != alpha { b.alphaValue = alpha }
+        let label = "Mac: \(model.statusLine)"
+        if label != shownLabel {
+            shownLabel = label
+            b.setAccessibilityLabel(label)
+            b.toolTip = label
+        }
         if let s = shown, s.glyph == glyph, s.animated == animated { return }
         shown = (glyph, animated)
         bounceReset?.cancel()

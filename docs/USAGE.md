@@ -45,11 +45,14 @@ settings.
 
 ## Interrupting Mac
 
-Talk over Mac while it speaks and it pauses as soon as it hears voice for
-`listen.barge_in_onset_ms` (300 ms). What you said then decides: silence, a backchannel
-("yeah", "mm-hmm"), an echo of Mac's own words, or fewer than `listen.barge_in_min_words` (3)
-words let it resume from the last word gap; real words (and interjections such as "wait" or
-"hold on", however short) stop it for good. If Mac had finished thinking, your words become a
+Talk over Mac while it speaks and it pauses once it has made out an interruption in what it
+hears: "stop", "wait" or "hold on" at once, anything else after three words
+(`listen.barge_in_min_words`), usually within a second of your first word. A cough, a door,
+other noise, a "yeah" or "mm-hmm", and its own voice coming back through the microphone do not
+pause it. Set `listen.barge_in_confirm = false` to pause on any sound of
+`listen.barge_in_onset_ms` (300 ms) instead. Once you stop talking, what you said decides:
+silence, a backchannel, an echo of Mac's own words or fewer than three words let it carry on;
+real words (and "wait" or "hold on", however short) stop it for good. If Mac had finished thinking, your words become a
 new request; if it was still working, they are passed to it as a steer. Either way Claude is
 told which part of its answer you heard and which part you did not. "stop" always stops. A
 confirmation question is never paused, and nothing said over it counts except "stop"; answer

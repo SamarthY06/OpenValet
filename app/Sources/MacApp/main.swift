@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     let audio = AudioEngine()
     let control = ControlClient()
+    let watchdog = MainThreadWatchdog()
     let tasks = TasksClient()
     let supervisor = Supervisor()
     let perms = Permissions()
@@ -63,8 +64,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusBar.refreshIcon()
             self.power.stateChanged(s)
         }
+        // Echo cancelling follows the daemon's state from the socket's reader thread, never via the UI.
+        control.onDaemonState = { [audio] in audio.daemonStateChanged($0) }
         control.onEvent = { [weak self] e in
             guard let self else { return }
+            if (e["event"] as? String) == "e2e_stall", Paths.flag("MAC_E2E") {
+                // Test hook (scripts/e2e.sh): hold the main thread, to prove audio does not wait for it.
+                Thread.sleep(forTimeInterval: min((e["seconds"] as? Double) ?? 0, 10))
+                return
+            }
             if (e["event"] as? String) == "notify" {
                 self.notify(title: (e["title"] as? String) ?? "Mac", body: (e["body"] as? String) ?? "",
                             path: e["path"] as? String)
@@ -141,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         installSignalHandlers()
+        watchdog.start()
         power.start()
         control.start()
         tasks.start()
@@ -243,9 +252,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ note: Notification) {
         Log.info("terminating")
+        watchdog.stop()   // stopping the daemon below may hold this thread for seconds: not a stall
+        audio.shutdown()  // before the control link drops: its `.unknown` must not rebuild the engine
         control.stop()
         tasks.stop()
-        audio.shutdown()
         supervisor.stopSync()
     }
 

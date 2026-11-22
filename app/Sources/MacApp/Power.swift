@@ -34,8 +34,6 @@ final class Power {
     private var powerSource: CFRunLoopSource?
     private(set) var onAC = true
     private var screenLocked = false
-    private var aecOffTimer: Timer?
-    private var lastState: AgentState = .unknown
     private var noNap: NSObjectProtocol?
     private var turnActivity: NSObjectProtocol?
     private var observers: [NSObjectProtocol] = []
@@ -180,34 +178,8 @@ final class Power {
         control.send("power", ["event": screenLocked ? "screen_locked" : "screen_unlocked"])
     }
 
-    /// Called with every daemon state change.
+    /// Called with every state change the UI sees: holds the per-turn power assertion.
     func stateChanged(_ state: AgentState) {
-        // Voice processing (AEC) while Mac may speak: on from `thinking` onwards, kept through
-        // FOLLOWUP and for 60 s after the turn ends (people follow up), then off. Never toggled
-        // at `listening` (a rebuild there would eat the words after "Hey Mac"). Each toggle is
-        // an engine rebuild, so this keeps rebuilds to about one per conversation.
-        switch state {
-        case .thinking, .speaking, .confirming, .followup:
-            aecOffTimer?.invalidate(); aecOffTimer = nil
-            audio.setVoiceProcessingWanted(true)
-        case .idle:
-            if aecOffTimer == nil {
-                // 60 s of quiet before dropping AEC (env MAC_AEC_IDLE_S overrides; e2e uses 3).
-                let delay = Double(Paths.env["MAC_AEC_IDLE_S"] ?? "") ?? 60
-                aecOffTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                    MainActor.assumeIsolated {
-                        guard let self else { return }
-                        self.aecOffTimer = nil
-                        if self.lastState == .idle { self.audio.setVoiceProcessingWanted(false) }
-                    }
-                }
-            }
-        case .off, .unknown, .error:
-            aecOffTimer?.invalidate(); aecOffTimer = nil
-            audio.setVoiceProcessingWanted(false)
-        case .listening: break
-        }
-        lastState = state
         let active = ![.idle, .unknown, .error, .off].contains(state)
         if active, turnActivity == nil {
             turnActivity = ProcessInfo.processInfo.beginActivity(

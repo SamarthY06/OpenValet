@@ -15,10 +15,17 @@ connect, then runs checks:
      fresh HELLO with a real input device and MIC frames resume at ~50/s
   8. control: app sends {"cmd":"subscribe"}; we push state/transcript events and log
      any commands the app sends (replying ok; remote_link gets a fake url)
+  9. an engine rebuild in the middle of speech (AEC coming on) keeps the rest of the audio:
+     DRAINED only after the whole stream could have played
+ 10. the UI thread held for 5 s (event `e2e_stall`, honoured only with MAC_E2E=1): echo
+     cancelling still comes on at once, straight from the socket's reader thread
+
+--amp 0 plays digital silence instead of the quiet tone (same code path, nothing to hear).
 
 Usage:
-  MAC_HOME=$(mktemp -d) python3 scripts/fake_daemon.py [--timeout 60] [--hold]
-  then launch:  open --env MAC_HOME=$MAC_HOME --env MAC_SUPERVISE=0 build/Mac.app
+  MAC_HOME=$(mktemp -d) python3 scripts/fake_daemon.py [--timeout 60] [--amp 0.05] [--hold]
+  then launch the app with the same MAC_HOME and MAC_SUPERVISE=0 MAC_AEC_IDLE_S=3 MAC_E2E=1
+  (scripts/e2e.sh does both, against build/OpenValet.app)
 
 Exit code 0 if all checks pass. --hold keeps serving (for manual UI poking) after checks.
 """
@@ -276,6 +283,7 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=60)
     ap.add_argument("--hold", action="store_true")
     ap.add_argument("--mic-seconds", type=float, default=5.0)
+    ap.add_argument("--amp", type=float, default=0.05, help="tone amplitude; 0 = digital silence")
     args = ap.parse_args()
 
     home = Path(os.environ.get("MAC_HOME", "")).expanduser()
@@ -373,7 +381,7 @@ def main() -> int:
     log(f"info: last mic frame RMS = {rms:.5f} (0.0 exactly = silence: mic permission not granted or muted)")
 
     # --- PLAY + END → DRAINED
-    pcm = tone(0.5)
+    pcm = tone(0.5, amp=args.amp)
     chunk = 24000 * 2 // 50  # 20 ms
     t_play = time.monotonic()
     for i in range(0, len(pcm), chunk):
@@ -390,7 +398,7 @@ def main() -> int:
     check("end_without_play", got, f"{(audio.drained.get(7, t) - t)*1000:.0f} ms")
 
     # --- FLUSH(id)
-    pcm3 = tone(3.0, freq=330)
+    pcm3 = tone(3.0, freq=330, amp=args.amp)
     for i in range(0, len(pcm3), chunk):
         audio.send(PLAY, u32(2) + u32(24000) + pcm3[i : i + chunk])
     time.sleep(0.3)
@@ -431,6 +439,70 @@ def main() -> int:
     with audio.cv:
         alive = len(audio.mic_times) > before + 30
     check("still_streaming_after_tests", alive, f"{len(audio.mic_times) - before} mic frames in 1 s after AEC-off rebuild")
+
+    def aec_on_since(n: int) -> bool:
+        return any(h.get("aec") and h.get("input_device") not in (None, "none") for h in audio.hellos[n:])
+
+    def aec_off_since(n: int) -> bool:
+        return any(h.get("aec") is False and h.get("input_device") not in (None, "none") for h in audio.hellos[n:])
+
+    def idle_until_aec_off(step: str) -> None:
+        """Back to idle, and wait for the engine to come back without voice processing."""
+        with audio.cv:
+            n = len(audio.hellos)
+        control.send({"event": "state", "state": "idle"})
+        if not audio.wait(lambda: aec_off_since(n), 15):
+            check(f"aec_off_before_{step}", False, "no HELLO with aec=false within 15 s of idle")
+        time.sleep(0.5)
+
+    # --- a rebuild in the middle of speech keeps the rest of it. AEC is off here; 3 s of audio
+    # is queued with its END, and 0.5 s in the state goes to `thinking` (engine rebuilt with
+    # voice processing). The stream must drain only after all of it could have played.
+    with audio.cv:
+        n_hello = len(audio.hellos)
+    t_play = time.monotonic()
+    for i in range(0, len(pcm3), chunk):
+        audio.send(PLAY, u32(20) + u32(24000) + pcm3[i : i + chunk])
+    audio.send(END, u32(20))
+    time.sleep(0.5)
+    control.send({"event": "state", "state": "thinking"})
+    got = audio.wait(lambda: 20 in audio.drained, 12)
+    dt = audio.drained.get(20, time.monotonic()) - t_play
+    check("rebuild_keeps_speech", got and aec_on_since(n_hello) and 2.95 <= dt <= 8.0,
+          f"DRAINED(20) after {dt:.3f}s (audio 3.000s, AEC rebuild at 0.5s)")
+    # ... and a FLUSH sent while the engine is being rebuilt stops the speech as soon as the
+    # rebuild is over (it is not played out on the new engine).
+    idle_until_aec_off("flush_during_rebuild")
+    with audio.cv:
+        n_hello = len(audio.hellos)
+    for i in range(0, len(pcm3), chunk):
+        audio.send(PLAY, u32(21) + u32(24000) + pcm3[i : i + chunk])
+    time.sleep(0.4)
+    control.send({"event": "state", "state": "thinking"})
+    time.sleep(0.15)
+    t = time.monotonic()
+    audio.send(FLUSH, u32(21))
+    with audio.cv:
+        mid = not aec_on_since(n_hello)  # the rebuild's HELLO had not come yet when FLUSH went out
+    got = audio.wait(lambda: 21 in audio.drained, 3)
+    lat = audio.drained.get(21, t) - t
+    check("flush_during_rebuild", got and lat < 2.0,
+          f"DRAINED(21) {lat*1000:.0f} ms after FLUSH(21), sent {'during' if mid else 'after'} the rebuild (audio 3.000s)")
+
+    # --- echo cancelling never waits for the UI: hold the app's main thread for 5 s, then say
+    # `thinking`. The engine must come back with voice processing while the UI is still stuck.
+    idle_until_aec_off("ui_stuck")
+    with audio.cv:
+        n_hello = len(audio.hellos)
+    control.send({"event": "e2e_stall", "seconds": 5.0})
+    time.sleep(0.3)
+    t = time.monotonic()
+    control.send({"event": "state", "state": "thinking"})
+    got = audio.wait(lambda: aec_on_since(n_hello), 4)
+    lat = time.monotonic() - t
+    check("aec_on_while_ui_stuck", got and lat < 4, f"voice processing on {lat:.2f}s after `thinking`, UI thread held for 5 s")
+    time.sleep(5.5)  # the stall ends; the watchdog's lines are checked by e2e.sh
+    idle_until_aec_off("churn")
 
     # --- rapid state churn: 20× idle→listening→thinking→speaking→idle in 6 s. The engine
     # must keep streaming and must never log a failed start (checked via the app's HELLOs:

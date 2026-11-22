@@ -8,6 +8,9 @@ enum AgentState: String {
     case off      // daemon switched off ("Turn Off")
     case unknown  // daemon not connected
 
+    /// The `state` field of a daemon event (any letter case; anything else is `.unknown`).
+    init(daemon: String?) { self = AgentState(rawValue: (daemon ?? "").lowercased()) ?? .unknown }
+
     /// Short status line (menu header, HUD caption). See docs/DESIGN.md "State vocabulary".
     var label: String {
         switch self {
@@ -279,7 +282,7 @@ final class AppModel: ObservableObject {
                 voiceUnavailable = v ? nil : (why.isEmpty ? "speech models missing" : UX.noDash(why))
                 voiceReason = v ? UX.noDash(why) : ""   // a real voice problem takes precedence (shown above)
             }
-            setState(AgentState(rawValue: ((e["state"] as? String) ?? "").lowercased()) ?? .unknown)
+            setState(AgentState(daemon: e["state"] as? String))
         case "transcript":
             let text = e["text"] as? String ?? ""
             let role = (e["role"] as? String ?? "user").lowercased()

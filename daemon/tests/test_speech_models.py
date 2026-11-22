@@ -280,6 +280,44 @@ async def test_listener_loop_time_while_tts_runs(stack):
 
 
 @needs_stt
+async def test_only_words_pause_mac_while_it_speaks(stack):
+    """What pauses Mac mid-sentence, with the real VAD and STT (AEC on): a sentence spoken over it does;
+    a noise, its own voice leaking back and a "yeah" do not."""
+    from macd.audio.file_backend import FileInput
+    from macd.speech.factory import make_listener
+
+    said = "Here is what I found about the weather in the city today."
+    rng = np.random.default_rng(1)
+
+    async def over_mac(sound: np.ndarray) -> list[ListenerEventKind]:
+        src = FileInput(padded(sound, 1.0, 1.5), realtime=False, trailing_silence_s=0.5)
+        lis = make_listener(src, stack, Config(), aec=True)
+        lis.set_speaking(True, said)
+        events = []
+
+        async def collect():
+            async for ev in lis.events():
+                events.append(ev)
+
+        await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 60)
+        return kinds(events)
+
+    burst = rng.normal(0, 0.1, SAMPLE_RATE).astype(np.float32)  # 1 s of loud hiss
+    knocks = np.zeros(SAMPLE_RATE * 2, np.float32)
+    n = SAMPLE_RATE // 16
+    for at in range(0, knocks.size - n, SAMPLE_RATE // 3):
+        knocks[at:at + n] += (rng.normal(0, 0.5, n) * np.exp(-np.arange(n) / (0.012 * SAMPLE_RATE))).astype(np.float32)
+    own = tts16(stack, said)
+    muffled = np.convolve(own, np.ones(12) / 12, "same") * 0.3  # as a loudspeaker's echo comes back
+    for name, sound in (("hiss", burst), ("knocks", knocks), ("own voice", own * 0.2), ("own voice, muffled", muffled),
+                        ("yeah", tts16(stack, "Yeah."))):
+        assert ListenerEventKind.BARGE_IN not in await over_mac(sound), name
+    for text in ("Wait, that is not what I asked for.", "Actually, can you also check the train times for Friday morning?"):
+        ks = await over_mac(tts16(stack, text))
+        assert ks == [ListenerEventKind.BARGE_IN, ListenerEventKind.UTTERANCE], (text, ks)
+
+
+@needs_stt
 async def test_stop_word_over_playback(stack):
     """UX#1: user says "stop" while Mac is talking (AEC on): UTTERANCE with window=SPEAKING."""
     from macd.audio.file_backend import FileInput

@@ -57,10 +57,14 @@ class ListenConfig:
     confirm_window_s: float = 10.0
     vad_threshold: float = 0.5
     tail_guard_ms: int = 300  # ignore input right after playback ends (no-AEC only)
-    # Talking over Mac (AEC only): VAD onset this long pauses speech; it stops for real only on
-    # this many words that are not a backchannel/echo, otherwise it resumes (LiveKit/Vapi style).
+    # Talking over Mac (AEC only): after a VAD onset this long, speech pauses once a quick STT probe
+    # hears an interruption: a stop word or "wait", or barge_in_min_words words that are not a
+    # backchannel or Mac's own (barge_in_confirm; off = pause on the onset itself, so any sound
+    # pauses it). The whole utterance is then judged by the same rule: it stops Mac for real or
+    # Mac carries on (LiveKit/Vapi style).
     barge_in: bool = True
     barge_in_onset_ms: int = 300
+    barge_in_confirm: bool = True
     barge_in_min_words: int = 3  # Pipecat MinWords default; live test: a misheard "mm-hmm" became "An engine."
 
 
