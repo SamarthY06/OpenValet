@@ -113,12 +113,13 @@ class Utterance:
     text: str  # wake phrase already stripped
     source: str  # AudioInput.name
     woke: bool  # True if this utterance started with a (verified) wake word
-    started_at: float  # monotonic
+    started_at: float  # monotonic: when the capture began (ended_at - started_at can exceed audio_s, which is trimmed)
     ended_at: float
     audio_s: float
     window: WindowReason | None = None  # which open window (followup/confirm/ptt) captured it, if any
     same_breath: bool = False  # speech began right after the wake phrase (no pause) -> skip the wake earcon
     continuation: bool = False  # continues a capture that hit max_utterance_s -> treat as steer, no ack
+    faint: bool = False  # heard over Mac's speech and never clearly a voice (leaked echo, someone far off)
 
 
 # ----------------------------------------------------------------------------- brain

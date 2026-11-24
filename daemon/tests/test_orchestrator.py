@@ -23,7 +23,13 @@ from macd.contracts import (
     State,
     WindowReason,
 )
-from macd.orchestrator import BARGE_NOTE, WORKING_NOTE, Orchestrator, interruption_note
+from macd.orchestrator import (
+    BARGE_NOTE,
+    CONTINUED_NOTE,
+    WORKING_NOTE,
+    Orchestrator,
+    interruption_note,
+)
 from macd.speech.segmenter import SentenceSegmenter
 from macd.speech_queue import SpeechQueue
 from macd.tasks import supervise
@@ -519,7 +525,7 @@ async def test_kept_talking_before_any_output_is_merged(rig: Rig) -> None:
 
 async def test_wakeless_speech_mid_task_is_steered_with_a_note(rig: Rig) -> None:
     tid = await start_turn(rig, "find flights to Goa", [*tool("Bash"), pause()])
-    await wait_until(lambda: rig.orch.turn.output_started)
+    await wait_until(lambda: rig.orch.turn.acted)
     rig.mic.say("only direct ones", window=WindowReason.TURN)
     await wait_until(lambda: rig.brain.steers)
     steer_tid, steer_text = rig.brain.steers[-1]
@@ -530,7 +536,7 @@ async def test_wakeless_speech_mid_task_is_steered_with_a_note(rig: Rig) -> None
 
 async def test_wakeless_backchannel_mid_turn_is_ignored(rig: Rig) -> None:
     await start_turn(rig, "find flights to Goa", [*tool("Bash"), pause()])
-    await wait_until(lambda: rig.orch.turn.output_started)
+    await wait_until(lambda: rig.orch.turn.acted)
     rig.mic.say("okay", window=WindowReason.TURN)
     await asyncio.sleep(0.05)
     assert rig.brain.steers == [] and len(rig.brain.asks) == 1
@@ -612,6 +618,11 @@ async def _answering(r: Rig, steps: list[Step] | None = None) -> int:
     return tid
 
 
+def _over(r: Rig, said: str, *, faint: bool = False) -> None:
+    """The user says this over Mac's speech, having begun once the reply was audible (a reaction to it)."""
+    r.mic.say(said, window=WindowReason.SPEAKING, took=0.1, faint=faint)
+
+
 async def test_barge_in_pauses_at_once_and_resumes_when_no_words(talky: Rig) -> None:
     await _answering(talky)
     _barge(talky)
@@ -627,7 +638,7 @@ async def test_backchannel_echo_and_short_words_resume(talky: Rig, heard: str) -
     await _answering(talky)
     _barge(talky)
     await wait_until(lambda: talky.speech.paused)
-    talky.mic.say(heard, window=WindowReason.SPEAKING)
+    _over(talky, heard)
     await wait_until(lambda: ANSWER in talky.spoken, timeout=4)
     assert len(talky.brain.asks) == 1 and talky.brain.steers == []
 
@@ -640,7 +651,8 @@ async def test_one_word_over_the_filler_finishes_the_request(talky: Rig) -> None
     talky.scripts["give me one fun fact about octopuses."] = [pause()]
     _barge(talky)
     await wait_until(lambda: talky.speech.paused)
-    talky.mic.say("octopuses.", window=WindowReason.SPEAKING)
+    await asyncio.sleep(0.2)
+    _over(talky, "octopuses.")  # begun after "On it." was audible: the filler is not the reply
     await wait_until(lambda: talky.brain.asks[-1][1] == "give me one fun fact about octopuses.")
     assert tid in talky.brain.interrupts and talky.orch.metrics.counters["merged_utterances"] == 1
 
@@ -650,7 +662,7 @@ async def test_real_barge_in_after_the_brain_is_done_starts_a_told_turn(talky: R
     _barge(talky)
     await wait_until(lambda: talky.speech.paused)
     talky.scripts["what about tomorrow"] = [pause()]
-    talky.mic.say("what about tomorrow", window=WindowReason.SPEAKING)
+    _over(talky, "what about tomorrow")
     await wait_until(lambda: len(talky.brain.asks) == 2)
     asked = talky.brain.asks[-1][1]
     assert asked.endswith(BARGE_NOTE + " what about tomorrow") and "they did not hear" in asked
@@ -663,7 +675,7 @@ async def test_real_barge_in_mid_turn_steers_and_later_speech_plays(talky: Rig) 
     tid = await _answering(talky, [text(ANSWER + "\n"), pause()])
     _barge(talky)
     await wait_until(lambda: talky.speech.paused)
-    talky.mic.say("no wait, count backwards", window=WindowReason.SPEAKING)
+    _over(talky, "no wait, count backwards")
     await wait_until(lambda: talky.brain.steers)
     steer_tid, steer = talky.brain.steers[-1]
     assert steer_tid == tid and steer.startswith("[Your last reply was cut off")
@@ -719,9 +731,211 @@ async def test_barge_in_off_keeps_the_old_rule(talky: Rig) -> None:
     _barge(talky)
     await asyncio.sleep(0.1)
     assert not talky.speech.paused
-    talky.mic.say("what about tomorrow", window=WindowReason.SPEAKING)
+    _over(talky, "what about tomorrow")
     await wait_until(lambda: ANSWER in talky.spoken, timeout=4)
     assert len(talky.brain.asks) == 1
+
+
+@pytest.mark.parametrize("window", [WindowReason.SPEAKING, WindowReason.TURN])
+async def test_speech_begun_before_the_reply_was_audible_is_the_rest_of_the_request(talky: Rig, window: WindowReason) -> None:
+    """Live 2026-11-24: a request said with a pause to think ended the turn; the rest arrived once
+    the reply was playing and was taken as a new request. About twenty requests in an hour were
+    split that way."""
+    await _answering(talky)  # the reply has been audible for 0.2 s; the user began a second ago
+    talky.mic.say("in reverse order please", window=window, took=1.0)
+    await wait_until(lambda: len(talky.brain.asks) == 2)
+    asked = talky.brain.asks[-1][1]
+    assert asked == CONTINUED_NOTE + " count to eight in reverse order please"  # answer afresh: no "you were cut off at"
+    assert BARGE_NOTE not in asked and talky.orch.metrics.counters["merged_utterances"] == 1
+    await asyncio.sleep(0.2)
+    assert ANSWER not in talky.spoken and P.STOPPED not in talky.spoken
+
+
+async def test_speech_while_the_reply_is_still_held_back_merges_and_says_so_once(talky: Rig) -> None:
+    tid = await start_turn(talky, "how tall is the tower", [text("A tower can be any height.\n", delay=0.1), pause()])
+    await wait_until(lambda: talky.orch.turn.first_text_t is not None)  # the brain has answered; not a word of it is audible
+    again = CONTINUED_NOTE + " how tall is the tower in Paris"
+    talky.scripts[again] = [text("About three hundred metres.\n", delay=0.1), pause()]
+    talky.mic.say("in Paris", took=1.0)
+    await wait_until(lambda: len(talky.brain.asks) == 2)
+    assert talky.brain.asks[-1][1] == again and tid in talky.brain.interrupts
+    await wait_until(lambda: talky.orch.turn.first_text_t is not None)  # answered again, and once more they go on: one note
+    talky.mic.say("in metres", took=0.5)
+    await wait_until(lambda: len(talky.brain.asks) == 3)
+    assert talky.brain.asks[-1][1] == again + " in metres"
+
+
+async def test_speech_after_the_brain_used_a_tool_steers_as_before(talky: Rig) -> None:
+    tid = await _answering(talky, [*tool("Read"), text(ANSWER + "\n"), pause()])
+    talky.mic.say("no wait, count backwards", window=WindowReason.SPEAKING, took=1.0)
+    await wait_until(lambda: talky.brain.steers)
+    assert talky.brain.steers[-1][1].endswith(BARGE_NOTE + " no wait, count backwards")
+    assert len(talky.brain.asks) == 1 and talky.orch.turn.id == tid
+
+
+async def test_a_faint_voice_over_mac_is_ignored_but_stop_still_stops(talky: Rig) -> None:
+    """Live 2026-11-24: Mac's own voice, leaked past echo cancelling, came back as sentences ("I
+    do not know what that is.") and cut seven replies; the user said "I didn't say anything"."""
+    await _answering(talky, [text(ANSWER + "\n"), text("And nine.\n"), pause()])
+    _barge(talky)  # a faint "stop" that STT did not catch after all pauses Mac; the verdict lets it go on
+    await wait_until(lambda: talky.speech.paused)
+    _over(talky, "I do not know what that is", faint=True)
+    await wait_until(lambda: "And nine." in talky.spoken, timeout=4)
+    assert ANSWER in talky.spoken and len(talky.brain.asks) == 1 and talky.brain.steers == []
+    _over(talky, "stop", faint=True)
+    await wait_until(lambda: P.STOPPED in talky.spoken, timeout=4)
+
+
+async def _answered(r: Rig) -> None:
+    r.scripts["count to eight"] = [text(ANSWER + "\n")]
+    r.mic.say("count to eight", woke=True)
+    await wait_until(lambda: r.orch.state == State.FOLLOWUP, timeout=4)
+
+
+async def test_a_reply_begun_over_macs_last_words_is_a_follow_up(talky: Rig) -> None:
+    """Live 2026-11-24: the user started answering over the end of Mac's reply nine times; each was
+    dropped as "speech over Mac" (a 37-word question among them) and they asked "Are you there?"."""
+    await _answered(talky)
+    await wait_until(lambda: talky.orch.state == State.IDLE, timeout=4)  # a long reply: the window has run out meanwhile
+    talky.mic.say("and what comes after eight", window=WindowReason.SPEAKING, took=3.0)
+    await wait_until(lambda: len(talky.brain.asks) == 2)
+    assert talky.brain.asks[-1][1] == "and what comes after eight"
+    assert talky.orch.metrics.counters["tail_replies"] == 1
+
+
+@pytest.mark.parametrize(("said", "kw"), [
+    ("someone has got a little bit of a microphone", {"took": 3.0, "faint": True}),  # leaked echo, a far voice
+    ("five six seven eight", {"took": 3.0}),  # Mac's own last words
+    ("and what comes after eight", {"took": 0.1}),  # begun after the follow-up window closed
+    ("Then", {"took": 3.0}),  # a fragment: the follow-up rule still applies
+    ("Okay.", {"took": 3.0}),  # murmured along with an explanation: not a reply to it
+])
+async def test_speech_after_the_reply_that_is_not_a_follow_up_is_ignored(talky: Rig, said: str, kw: dict) -> None:
+    await _answered(talky)
+    await wait_until(lambda: talky.orch.state == State.IDLE, timeout=4)
+    talky.mic.say(said, window=WindowReason.SPEAKING, **kw)
+    await asyncio.sleep(0.1)
+    assert len(talky.brain.asks) == 1 and talky.orch.turn is None
+
+
+async def test_speech_over_stopped_does_not_ride_on_an_old_follow_up_window(talky: Rig) -> None:
+    talky.orch.cfg.listen.followup_s = 30.0
+    await _answered(talky)
+    talky.scripts["and backwards"] = [pause()]
+    talky.mic.say("and backwards", window=WindowReason.FOLLOWUP)
+    await wait_until(lambda: len(talky.brain.asks) == 2)
+    talky.mic.say("stop", window=WindowReason.SPEAKING)
+    await wait_until(lambda: talky.orch.turn is None)
+    talky.mic.say("no I meant something else entirely", window=WindowReason.SPEAKING, took=0.1)
+    await asyncio.sleep(0.1)
+    assert len(talky.brain.asks) == 2 and talky.orch.turn is None
+
+
+async def test_another_mics_speech_over_macs_last_words_is_not_a_reply(talky: Rig) -> None:
+    desk = FakeListener("desk")
+    talky.orch.add_listener(desk)
+    talky.orch.cfg.listen.followup_s = 30.0
+    await _answered(talky)
+    desk.say("and what comes after eight", window=WindowReason.SPEAKING, took=3.0)
+    await asyncio.sleep(0.3)
+    assert len(talky.brain.asks) == 1 and talky.orch.turn is None
+
+
+async def test_room_speech_during_a_phone_reply_is_not_a_reply_once_the_caller_hangs_up() -> None:
+    tts = FakeTTS()
+    local, remote_out = FakeOutput(tts, "local"), FakeOutput(tts, "remote")
+    r, task = await make_rig(outputs={"local": local, "remote": remote_out})
+    r.brain.alive = True
+    r.orch.cfg.listen.followup_s = 30.0
+    phone = FakeListener("remote:phone")
+    try:
+        r.orch.on_remote_session("4207")
+        r.orch.add_listener(phone, requires_wake=False)
+        r.orch.set_remote_present(True, "phone")
+        phone.say("four two zero seven")
+        await wait_until(lambda: P.PIN_OK in remote_out.spoken)
+        r.scripts["what's on my calendar"] = [text("You have two meetings.\n")]
+        phone.say("what's on my calendar")
+        await wait_until(lambda: r.orch.turn is None and r.orch.state == State.FOLLOWUP, timeout=4)
+        r.orch.remove_listener("remote:phone")  # the caller hangs up; the room mic is the only one left
+        r.orch.set_remote_present(False)
+        r.mic.say("shall we order the pizza now or later", window=WindowReason.SPEAKING, took=3.0)
+        await asyncio.sleep(0.3)
+        assert len(r.brain.asks) == 1
+    finally:
+        await teardown(r, task)
+
+
+@pytest.mark.parametrize("window", [WindowReason.SPEAKING, WindowReason.TURN])
+async def test_go_to_sleep_is_never_the_rest_of_a_request(talky: Rig, window: WindowReason) -> None:
+    await _answering(talky)
+    talky.mic.say("go to sleep", window=window, took=1.0)  # begun before the reply was audible
+    await wait_until(lambda: talky.orch.turn is None or talky.orch.turn.id != 1, timeout=4)
+    assert talky.orch.metrics.counters.get("merged_utterances", 0) == 0
+    assert not any(asked.endswith("count to eight go to sleep") for _, asked in talky.brain.asks)
+
+
+@pytest.mark.parametrize("command", ["listen", "stop", "off"])
+async def test_a_follow_up_window_ended_by_a_command_takes_no_late_reply(talky: Rig, command: str) -> None:
+    talky.orch.cfg.listen.followup_s = 30.0
+    await _answered(talky)
+    if command == "listen":
+        assert talky.orch.listen() == "local"  # push-to-talk: what comes next is its own request
+    elif command == "stop":
+        assert await talky.orch.stop() is False
+    else:
+        talky.orch.set_off(True, persist=False)
+    talky.mic.say("no I meant something else entirely", window=WindowReason.SPEAKING, took=0.1)
+    await asyncio.sleep(0.3)
+    assert len(talky.brain.asks) == 1 and talky.orch.turn is None
+
+
+@pytest.mark.parametrize("ender", ["stop the other task", "stop everything", "go to sleep"])
+async def test_a_follow_up_window_ended_on_purpose_takes_no_late_reply(talky: Rig, ender: str) -> None:
+    """The window is closed by what the user said in it; words over Mac's line about that are not a reply."""
+    talky.orch.cfg.listen.followup_s = 30.0
+
+    async def stop_other() -> bool:
+        return True
+
+    talky.orch.stop_other = stop_other
+    await _answered(talky)
+    lines = len(talky.out.play_started)
+    talky.mic.say(ender, window=WindowReason.FOLLOWUP)
+    await wait_until(lambda: len(talky.out.play_started) > lines, timeout=4)  # "Stopping the other task.", "Going off." …
+    talky.mic.say("no I meant something else entirely", window=WindowReason.SPEAKING, took=0.1)
+    await asyncio.sleep(0.3)
+    assert len(talky.brain.asks) == 1 and talky.orch.turn is None
+
+
+async def test_yes_over_the_end_of_a_question_is_a_follow_up(talky: Rig) -> None:
+    talky.scripts["count to eight"] = [text("Shall I count to eight?\n")]
+    talky.mic.say("count to eight", woke=True)
+    await wait_until(lambda: talky.orch.state == State.FOLLOWUP, timeout=4)
+    talky.mic.say("Yes", window=WindowReason.SPEAKING, took=1.0)
+    await wait_until(lambda: len(talky.brain.asks) == 2)
+    assert talky.brain.asks[-1][1] == "Yes"
+
+
+async def test_a_reply_paused_before_its_first_word_still_counts_as_heard_once_it_plays() -> None:
+    """Paused while the first sentence was being made, then let go on: the reply is audible from
+    then, and what the user says next is a reaction to it, not the rest of the request."""
+    r, task = await make_rig(outputs={"local": FakeOutput(FakeTTS(delay=0.8, samples=8_000), play_s=0.5)})
+    r.brain.alive = True
+    try:
+        tid = await start_turn(r, "count to eight", [text(ANSWER + "\n"), text("And nine.\n"), pause()])
+        await wait_until(lambda: r.speech._playing is not None and r.speech._playing.text == ANSWER, timeout=4)
+        _barge(r)
+        await wait_until(lambda: r.speech._held is not None, timeout=4)
+        _over(r, "mm-hmm")
+        await wait_until(lambda: any(t == ANSWER for t, _ in r.out.play_started), timeout=4)
+        assert r.orch.turn.answer_t is not None
+        await asyncio.sleep(0.2)
+        _over(r, "no wait, count backwards")
+        await wait_until(lambda: r.brain.steers)
+        assert len(r.brain.asks) == 1 and r.orch.turn.id == tid
+    finally:
+        await teardown(r, task)
 
 
 def test_interruption_note() -> None:

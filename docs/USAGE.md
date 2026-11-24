@@ -49,19 +49,34 @@ Talk over Mac while it speaks and it pauses once it has made out an interruption
 hears: "stop", "wait" or "hold on" at once, anything else after three words
 (`listen.barge_in_min_words`), usually within a second of your first word. A cough, a door,
 other noise, a "yeah" or "mm-hmm", and its own voice coming back through the microphone do not
-pause it. Set `listen.barge_in_confirm = false` to pause on any sound of
-`listen.barge_in_onset_ms` (300 ms) instead. Once you stop talking, what you said decides:
-silence, a backchannel, an echo of Mac's own words or fewer than three words let it carry on;
-real words (and "wait" or "hold on", however short) stop it for good. If Mac had finished thinking, your words become a
-new request; if it was still working, they are passed to it as a steer. Either way Claude is
-told which part of its answer you heard and which part you did not. "stop" always stops. A
-confirmation question is never paused, and nothing said over it counts except "stop"; answer
-once Mac has finished asking, with a yes to the whole question.
+pause it. A faint or distant sound (Mac's own speech leaking back, someone talking in another
+room) is ignored whatever words speech recognition makes of it; only "stop" still counts.
+`listen.barge_in_min_confidence` (0.95) sets how clearly it must register as a voice at the
+microphone, and 0 switches that check off. If you speak softly or sit far from the microphone
+and Mac ignores you when you talk over it, lower it (try 0.8). Set
+`listen.barge_in_confirm = false` to pause on any sound of `listen.barge_in_onset_ms` (300 ms)
+instead. Once you stop talking, what you said decides: silence, a backchannel, an echo of Mac's
+own words or fewer than three words let it carry on; real words (and "wait" or "hold on",
+however short) stop it for good. If Mac had finished thinking, your words become a new request;
+if it was still working, they are passed to it as a steer. Either way Claude is told which part
+of its answer you heard and which part you did not. "stop" always stops.
 
-While a task runs you can keep talking without the wake word. Words said before Claude has
-produced anything merge into the request ("book a meeting with Sam", "on Friday at three");
-later words reach it as a steer, marked as said without the wake word, and whether they are
-meant for Mac is its call.
+If you paused to think and carried on before the answer started playing, you were not
+interrupting: what you said is the rest of your request ("book a meeting with Sam", "on Friday
+at three"). Mac drops the answer it had begun and answers the whole request; you may hear the
+first words of the first answer, then a short silence. This holds as long as Mac has not
+started acting on the request (searching, opening something, asking you to confirm). After
+that, and for anything you say once the answer is playing, your words reach Claude as a steer
+or a new request, marked as said without the wake word, and whether they are meant for Mac is
+its call.
+
+If you start replying over Mac's last words and finish after it does, that is your follow-up,
+with no wake word needed. A "yeah" or "okay" said along with Mac counts as a reply only when
+Mac had just asked a question.
+
+Talk over a confirmation question and Mac pauses it. A clear yes or no counts. A longer reply is
+taken as a change: nothing is sent and Claude is told what you said. A short unclear sound lets
+the question finish. A faint yes does not count; answer again once Mac has finished asking.
 
 Barge-in needs the app's echo cancellation (the built-in audio path). `listen.barge_in = false`
 restores the old rule: speech over Mac is dropped and only "stop" interrupts.

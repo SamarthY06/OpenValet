@@ -120,13 +120,13 @@ class FakeListener:
         self.push(ListenerEvent(ListenerEventKind.WAKE, self.source_name, wake=WakeHit("hey mac", 0)))
 
     def say(self, text: str, woke: bool = False, *, window: WindowReason | None = None,
-            continuation: bool = False, same_breath: bool = False) -> None:
-        """Deliver one utterance; `woke=True` also emits the preceding WAKE event."""
+            continuation: bool = False, same_breath: bool = False, took: float = 1.0, faint: bool = False) -> None:
+        """Deliver one utterance that took `took` seconds to say; `woke=True` also emits the preceding WAKE event."""
         now = time.monotonic()
         if woke:
             self.wake()
-        utt = Utterance(text=text, source=self.source_name, woke=woke, started_at=now - 1, ended_at=now, audio_s=1.0,
-                        window=window, same_breath=same_breath, continuation=continuation)
+        utt = Utterance(text=text, source=self.source_name, woke=woke, started_at=now - took, ended_at=now, audio_s=took,
+                        window=window, same_breath=same_breath, continuation=continuation, faint=faint)
         self.push(ListenerEvent(ListenerEventKind.UTTERANCE, self.source_name, utterance=utt))
 
     def reasons(self) -> list[WindowReason]:

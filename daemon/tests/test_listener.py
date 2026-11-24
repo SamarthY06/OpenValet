@@ -34,10 +34,12 @@ class FakeWake:
 
 
 class FakeVAD:
-    """Speech = frame energy above zero (test audio is 0.5 in speech regions)."""
+    """Speech = frame energy above zero (test audio is 0.5 in speech regions). A region at a tenth
+    of that is a faint sound: speech to the VAD, but it is only 0.8 sure."""
 
     def accept(self, frame):
-        return 1.0 if float(np.abs(frame).max()) > 0.1 else 0.0
+        peak = float(np.abs(frame).max())
+        return 1.0 if peak > 0.1 else 0.8 if peak > 0.02 else 0.0
 
     def reset(self):
         pass
@@ -588,7 +590,7 @@ async def test_every_speaking_capture_logs_its_numbers_and_never_any_text():
     assert set(ev["probe_heard"]) <= {"none", "echo", "backchannel", "few", "words"}  # and categories, never the words
     assert ev.pop("probe_ms") >= 0
     assert ev == {
-        "source": "file", "aec": True, "barge": True, "paused": True, "began": "onset",
+        "source": "file", "aec": True, "barge": True, "paused": True, "faint": False, "began": "onset",
         "capture_ms": 3000,  # 0.3 s lead-in, 2 s of speech, 0.7 s of silence
         "voiced_ms": 2000, "vad_max": 1.0, "vad_mean": pytest.approx(0.73, abs=0.02),
         "peak_dbfs": -6.0, "rms_dbfs": pytest.approx(-7.2, abs=0.1),
@@ -604,6 +606,62 @@ async def test_every_speaking_capture_logs_its_numbers_and_never_any_text():
     sink = EventSink()
     await run(np.zeros(SAMPLE_RATE * 2, np.float32), wake_at=None, before=lambda l: (_speaking_aec()(l), setattr(l, "eventlog", sink)))
     assert sink.events == []  # no capture, no event
+
+
+async def test_a_faint_sound_over_mac_never_pauses_it_except_for_stop_and_its_words_are_marked_faint():
+    """Live 2026-11-24, 331 sounds over Mac's speech: the user's voice always took the VAD to 0.98
+    or more; Mac's own leaked echo and far voices stayed at 0.91 or less, yet STT made sentences
+    of them, which paused Mac six times and cut seven replies."""
+    def before(times, sink):
+        return lambda l: (_speaking_aec()(l), setattr(l, "eventlog", sink), times.append(_pause_times(l)))
+
+    times, sink, stt = [], EventSink(), FakeSTT("I do not know what that is")
+    kinds, events, _ = await run(audio((1.0, 3.0)) * 0.1, wake_at=None, stt=stt, before=before(times, sink))
+    assert kinds == [K.UTTERANCE] and times[0] == [] and len(stt.calls) > 1  # listened to (for "stop"), not acted on
+    assert events[0].utterance.faint and events[0].utterance.window is WindowReason.SPEAKING
+    (ev,) = [f for t, f in sink.events if t == "barge_capture"]
+    assert ev["faint"] and ev["probe_heard"][0] == "words" and not ev["paused"] and ev["vad_max"] == 0.8
+
+    # a quiet "stop" pauses Mac as fast as a clear one
+    times = []
+    kinds, events, _ = await run(audio((1.0, 1.6)) * 0.1, wake_at=None, stt=FakeSTT("stop"), before=before(times, EventSink()))
+    assert kinds == [K.BARGE_IN, K.UTTERANCE] and events[1].utterance.faint and times[0][0] < 1.5
+
+    # quiet at first, then clearly a voice: pauses Mac once it is clear, and not faint
+    pcm, times = audio((1.0, 3.0)), []
+    pcm[SAMPLE_RATE : int(1.6 * SAMPLE_RATE)] *= 0.1
+    kinds, events, _ = await run(pcm, wake_at=None, stt=FakeSTT("what about tomorrow then"), before=before(times, EventSink()))
+    assert kinds == [K.BARGE_IN, K.UTTERANCE] and not events[1].utterance.faint
+    assert 1.6 < times[0][0] <= 1.7 and len(times[0]) == 1
+
+    # a quiet voice while Mac is silent is just a quiet voice
+    kinds, events, _ = await run(audio((1.0, 2.0)) * 0.1, wake_at=None, stt=FakeSTT("what about tomorrow then"),
+                                   before=lambda l: l.open_window(3600, WindowReason.FOLLOWUP))
+    assert kinds[-1] == K.UTTERANCE and not events[-1].utterance.faint
+
+    # a quiet voice already talking when Mac starts its reply was good enough in silence: it still counts
+    times, stt = [], FakeSTT("and also in metres please")
+    kinds, events, _ = await run(audio((1.0, 3.0)) * 0.1, wake_at=None, stt=stt,
+                                   before=lambda l: (setattr(l, "_aec", True), l.open_window(3600, WindowReason.TURN),
+                                                     times.append(_pause_times(l)),
+                                                     _at(l, (2.0, lambda l: l.set_speaking(True, "The tower is three hundred metres tall")))))
+    assert kinds == [K.SPEECH_START, K.BARGE_IN, K.UTTERANCE] and 2.0 <= times[0][0] < 2.2 and not events[2].utterance.faint
+
+
+async def test_pause_after_ms_counts_from_when_both_were_talking():
+    """The user starts over the filler and talks on through the silence after it; the reply starts
+    into that. The pause comes 60 ms after the reply's first sound, not "1.5 s after the onset"."""
+    sink = EventSink()
+
+    def before(l):
+        _speaking_aec("On it.")(l)
+        l.eventlog = sink
+        _at(l, (1.1, lambda l: l.set_speaking(False)), (2.4, lambda l: l.set_speaking(True, "The best people to connect with")))
+
+    kinds, _, _ = await run(audio((1.0, 3.0)), wake_at=None, stt=FakeSTT("and also check the resume folder"), before=before)
+    assert kinds == [K.BARGE_IN, K.UTTERANCE]
+    (ev,) = [f for t, f in sink.events if t == "barge_capture"]
+    assert ev["began"] == "onset" and ev["paused"] and 40 <= ev["pause_after_ms"] <= 80
 
 
 async def test_barge_in_confirm_off_pauses_on_the_onset_as_before():
@@ -693,8 +751,12 @@ async def test_smart_turn_finished_ends_the_turn_before_silence_ms():
 
 async def test_smart_turn_not_finished_but_nothing_follows_ends_at_max_silence():
     turn = FakeTurn(0.1)
-    kinds, _, _ = await run(audio((1.0, 2.0), total_s=5.0), wake_at=None, stt=FakeSTT("tell me about"), turn=turn, before=_window)
+    kinds, events, _ = await run(audio((1.0, 2.0), total_s=5.0), wake_at=None, stt=FakeSTT("tell me about"), turn=turn, before=_window)
     assert kinds == [K.SPEECH_START, K.UTTERANCE] and len(turn.seen) == 1
+    # started_at is when the speech began on the clock: 2 s of waited-out silence lie between its end and now,
+    # and all but 0.3 s of that is trimmed from the audio (the orchestrator compares it with when the reply began)
+    utt = events[1].utterance
+    assert utt.audio_s < 1.8 and utt.ended_at - utt.started_at == pytest.approx(utt.audio_s + 1.7, abs=0.05)
     cfg = Config()
     cfg.listen.turn_max_silence_ms = 5000  # longer than the input: only end-of-input finalises it
     _, events, _ = await run(audio((1.0, 2.0), total_s=3.5), wake_at=None, stt=FakeSTT("tell me about"), cfg=cfg,

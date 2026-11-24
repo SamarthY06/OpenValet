@@ -9,20 +9,27 @@ Input policy ("partner" = the mic of a voice turn's speaker; its TURN window nee
 |---------------------|-----------------------------------------|------------------------------------------|
 | IDLE / LISTENING    | woke (or PTT window / remote)           | new turn                                 |
 | FOLLOWUP            | any from the turn's source              | new turn (same conversation)             |
+|                     | partner, begun over Mac's last words,   | the same: a follow-up (a backchannel     |
+|                     |   ended after the turn did              |   only if Mac had asked a question)      |
 | any, Mac talking    | stop words (any source, wake or not)    | interrupt + "Okay, stopped."             |
 | SPEAKING (barge-in) | partner, VAD onset ≥ 300 ms (AEC on)    | pause speech at once                     |
 |                     | then no words / backchannel / echo /    | resume from just before the cut          |
 |                     |   < 2 words (not "wait"…)               |   (false interruption)                   |
 |                     | then real words                         | cut speech; brain told what was heard;   |
 |                     |                                         | brain done → new turn, else steer        |
+|                     | faint (never clearly a voice at the mic)| ignored, whatever STT heard; only stop   |
+|                     |                                         |   words pause and count                  |
 | THINKING / SPEAKING | woke: anything else / continuation      | steer (+ "Got it." unless cont.) (AG17)  |
-|                     | partner, no wake word                   | brain silent so far → merged re-ask;     |
-|                     |   (backchannels ignored)                | else steer, marked as said without wake  |
+|                     | partner, no wake word                   | begun before the reply was audible, no   |
+|                     |   (backchannels ignored)                |   tool or confirmation yet → merged      |
+|                     |                                         |   re-ask; else steer, marked as said     |
+|                     |                                         |   without wake                           |
 |                     | anyone else, no wake word               | ignored (logged)                         |
 | CONFIRMING          | affirmative                             | gate.resolve(True)                       |
 |                     | bare negative / timeout                 | gate.resolve(False)                      |
 |                     | longer reply ("yes but …")              | gate.resolve(False) + steer              |
-|                     | over the prompt (not a stop word)       | ignored: a yes needs the whole question  |
+|                     | over the prompt                         | a clear yes / explicit no / longer reply |
+|                     |                                         |   resolves it; else the prompt finishes  |
 | OFF                 | —                                       | listeners muted; nothing arrives         |
 """
 
@@ -36,7 +43,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from macd import config
@@ -85,8 +92,19 @@ RESUME_DELAY_S = 2.0
 RESTART_NOTE = ("[Mac was restarted while working on this request and is picking it up where it left off, in "
                 "this same conversation. Continue; do not start over or repeat what is already done.]")
 
+CONTINUED_NOTE = ("[The user paused mid-sentence and was still speaking when you began to answer, so that answer was "
+                  "dropped; they heard at most its first words. What follows is their whole request. Answer it once, "
+                  "from the start, without mentioning the interruption or the earlier answer. Words at the end that are not part of the "
+                  "request (an aside, a check that you are still there) can be ignored.]")
+REPLY_KINDS = ("answer", "say", "confirm")  # speech that is the brain's reply (not a filler, heartbeat or earcon)
+
 WORKING_NOTE = ("[Said while you were working, without the wake word. If it is not meant for you, ignore it "
                 "and continue.]")
+
+
+def _asked(turn: Turn) -> bool:
+    """The turn's reply ended with a question."""
+    return bool(turn.assistant) and turn.assistant[-1].rstrip().endswith("?")
 
 
 def interruption_note(heard: str, unheard: str) -> str:
@@ -145,7 +163,8 @@ class Turn:
     releasing: bool = False  # this text block is the answer: stream it
     assistant: list[str] = field(default_factory=list)
     context: str = ""  # note(s) prepended to `text` in the brain's ask (cut-off reply, barge-in)
-    output_started: bool = False  # the brain produced something (text, say, tool, confirm)
+    acted: bool = False  # the brain used a tool or asked for a confirmation: the request is under way
+    answer_t: float | None = None  # when the first word of its reply (not the filler) became audible
 
     @property
     def remote(self) -> bool:
@@ -391,6 +410,8 @@ class Orchestrator:
     def _speak(self, turn: Turn, text: str, kind: str = "answer", *, priority: bool = False) -> None:
         def on_play(t: Turn = turn) -> None:
             t.last_speech = time.monotonic()
+            if t.answer_t is None and kind in REPLY_KINDS:
+                t.answer_t = t.last_speech
             if not t.first_audio:
                 t.first_audio = True
                 self.metrics.observe_since("transcript_to_first_audio", t.transcript_t)
@@ -398,7 +419,7 @@ class Orchestrator:
         text = P.dedash(text)
         if self.speech.say(turn.id, text, kind, output=turn.output, priority=priority, on_play=on_play):  # type: ignore[arg-type]
             turn.last_speech = time.monotonic()
-            if kind in ("answer", "say", "confirm"):
+            if kind in REPLY_KINDS:
                 self._transcript("assistant", text, turn_id=turn.id, source=turn.source, kind=kind,
                                  remote=turn.remote)
 
@@ -413,7 +434,7 @@ class Orchestrator:
             with contextlib.suppress(Exception):
                 lst.set_speaking(True, text)
         self._cancel_timer("thinking")
-        if self.turn is not None and self.state == State.THINKING and kind in ("answer", "say", "confirm"):
+        if self.turn is not None and self.state == State.THINKING and kind in REPLY_KINDS:
             self._set_state(State.SPEAKING, "speech")
 
     def _on_speech_idle(self) -> None:
@@ -517,7 +538,7 @@ class Orchestrator:
         wake_t = ev.wake.t if ev.wake else ev.t
         output = self._output_for_source(ev.source)
         if self.turn is None or self.state in (State.IDLE, State.FOLLOWUP, State.LISTENING):
-            self._cancel_timer("followup")
+            self._cancel_timer("followup")  # heard something: the window's deadline still stands
             # Blip only if the user paused after "Hey Mac": a SPEECH_START/UTTERANCE in the same
             # breath cancels it (UX#15).
             self._timer("wake-blip", WAKE_BLIP_DELAY_S, lambda: self._play_earcon(
@@ -532,7 +553,7 @@ class Orchestrator:
         if self._local_suppressed(ev.source):
             return
         if self.turn is None and self.state in (State.IDLE, State.FOLLOWUP) and ev.window is not None:
-            self._cancel_timer("followup")
+            self._cancel_timer("followup")  # heard something: the window's deadline still stands
             self._set_state(State.LISTENING, "speech")
 
     def _on_no_speech(self, ev: ListenerEvent) -> None:
@@ -579,8 +600,12 @@ class Orchestrator:
         partner = self._is_partner(turn, source)
         try:
             # ------------------------------------------------------------ speech over Mac
-            if window == WindowReason.SPEAKING:
-                await self._on_speaking_utterance(turn, text, source, partner, ev.t)
+            if window == WindowReason.SPEAKING and self._is_tail_reply(utt, text, source):
+                # begun over Mac's last words, finished after them: the reply to what it just said
+                self.metrics.incr("tail_replies")
+                utt = replace(utt, window=WindowReason.FOLLOWUP)
+            elif window == WindowReason.SPEAKING:
+                await self._on_speaking_utterance(turn, utt, text, source, partner, ev.t)
                 return
             await self._on_turn_utterance(ev, utt, text, source, origin, woke, remote, partner, is_text)
         finally:
@@ -614,7 +639,7 @@ class Orchestrator:
                 (woke and not continuation) or window == WindowReason.FOLLOWUP or partner):
             self._activity("stop_other", turn.id if turn else None, text="Stopping the other task")
             if turn is None and self.state in (State.LISTENING, State.FOLLOWUP):
-                self._cancel_timer("followup")
+                self._end_followup()
                 self._set_state(State.IDLE, "stop other")
             self._tasks.spawn(self._stop_other(self._output_for_source(source)), "stop-other")
             return
@@ -640,7 +665,7 @@ class Orchestrator:
                 self._steer(turn, text, ack=False)
             elif not woke and P.is_backchannel(text):
                 self._ignore(source, text, "mid-turn backchannel")
-            elif not woke and not turn.output_started:  # kept talking before the brain said/did anything
+            elif not woke and self._still_asking(turn, partner, utt):  # kept talking: still the same request
                 await self._merge(turn, text, source, ev.t)
             else:  # "actually…", "no rush, also…": the model decides how to take it (AG17)
                 cut = self._cut_speech(turn) if self._barge == turn.id else ""
@@ -657,6 +682,9 @@ class Orchestrator:
                 self._ignore(source, text, "speaking tail backchannel")
                 return
             stop = P.is_stop(text)
+            if not stop and not woke and self._still_asking(turn, partner, utt):
+                await self._merge(turn, text, source, ev.t)
+                return
             await self._cancel_turn(turn, "stop words" if stop else "new utterance", speak=stop, keep_windows=not stop)
             if stop:
                 return
@@ -681,7 +709,7 @@ class Orchestrator:
             if remaining > 0.05:
                 self._open_window(source, remaining, WindowReason.FOLLOWUP)
             return
-        self._cancel_timer("followup")
+        self._end_followup()
         if P.is_stop(text):
             self.speech.flush_all()
             self._set_state(State.IDLE, "stop words")
@@ -720,7 +748,32 @@ class Orchestrator:
         self._barge = None
         self._cancel_timer("barge")
 
-    async def _on_speaking_utterance(self, turn: Turn | None, text: str, source: str, partner: bool,
+    def _end_followup(self) -> None:
+        """The follow-up window is over on purpose (a new turn, a stop, going off), not by running
+        out: speech still arriving from over Mac's words is no longer a reply to the last turn."""
+        self._cancel_timer("followup")
+        self._followup_deadline = 0.0
+
+    def _is_tail_reply(self, utt: Utterance, text: str, source: str) -> bool:
+        """Speech that began over the end of Mac's reply and finished after the turn did (live
+        2026-11-24: nine such replies were dropped as "speech over Mac", a 37-word question among
+        them, and the user asked "Are you there?"). It is what the follow-up window is for; the
+        window opened while this capture was already running, so it does not carry its name."""
+        last = self.last_turn
+        # the last turn's own mic, by name: `_is_partner` falls back to the room mic once a phone session has ended
+        return (self.turn is None and last is not None and not utt.faint and last.conversational and last.source == source
+                and utt.started_at < self._followup_deadline and not P.is_echo(text, " ".join(self._recent_spoken))
+                and (not P.is_backchannel(text) or _asked(last)))  # "okay" over an explanation is no reply; "yes" to a question is
+
+    def _still_asking(self, turn: Turn, partner: bool, utt: Utterance) -> bool:
+        """The user began this before a word of the reply was audible, and nothing has been done
+        yet: they were finishing the request, not reacting to the answer (live 2026-11-24: a pause
+        to think ended the turn, the rest arrived once the reply had started and was taken as a
+        new request on its own)."""
+        return (partner and not turn.acted and (turn.answer_t is None or utt.started_at < turn.answer_t)
+                and not P.is_off_request(utt.text))  # "go to sleep" is never the rest of a request
+
+    async def _on_speaking_utterance(self, turn: Turn | None, utt: Utterance, text: str, source: str, partner: bool,
                                      t: float) -> None:
         if P.is_stop_all(text) and partner:
             self._barge_clear()
@@ -733,6 +786,10 @@ class Orchestrator:
                 await self._cancel_turn(turn, "stop while speaking", speak=True)
             else:
                 self.speech.flush_all()
+            return
+        if utt.faint:  # never clearly a voice at the mic: Mac's own echo or someone far off, whatever STT made of it
+            self._ignore(source, text, "speaking: faint")
+            self._barge_resume("faint")
             return
         # Answering over the confirmation question (live 2026-11-12: the summary comes first and
         # "Send it?" last, so people answer over its tail; dropping those yeses looped the question
@@ -747,9 +804,9 @@ class Orchestrator:
                 self.speech.flush_turn(turn.id)  # the rest of the question is moot
                 self._resolve_confirm(turn, verdict, "utterance", text=text, confirm_source="voice")
                 return
-        # before the brain said anything real (only the "On it." filler plays), the user is still
-        # finishing the request: any words merge into it, however short ("…about" "octopuses")
-        early = turn is not None and partner and not turn.brain_done and not turn.output_started
+        # begun before any of the reply was audible (over the "On it." filler, or a thinking pause),
+        # the user is still finishing the request: any words merge into it, however short ("…about" "octopuses")
+        early = turn is not None and self._still_asking(turn, partner, utt)
         why = self._barge_reject(turn, text, partner, early=early)
         if why or turn is None:
             self._ignore(source, text, f"speaking: {why}")
@@ -759,12 +816,12 @@ class Orchestrator:
         self.metrics.incr("barge_ins")
         self._barge_clear()
         self._activity("barge_in", turn.id, text=text)
-        if turn.brain_done:  # only its speech is left: a new turn, told what the user missed
+        if early:  # talking over the filler or into the reply's first word: still one request
+            await self._merge(turn, text, source, t)
+        elif turn.brain_done:  # only its speech is left: a new turn, told what the user missed
             await self._cancel_turn(turn, "barge-in", speak=False, keep_windows=True)
             await self._start_turn(text, source, origin="remote" if turn.remote else "voice", transcript_t=t,
                                    context=BARGE_NOTE, filler=False)  # no "On it." right after a cut-in
-        elif not turn.output_started:  # talking over the filler: still one request
-            await self._merge(turn, text, source, t)
         else:
             self._steer(turn, _join(self._cut_speech(turn), BARGE_NOTE, text), ack=False, shown=text)
 
@@ -800,13 +857,18 @@ class Orchestrator:
         return interruption_note(" ".join(words[:n]), " ".join(words[n:]))
 
     async def _merge(self, turn: Turn, text: str, source: str, t: float) -> None:
-        """The user kept talking before the brain produced anything: re-ask with the whole
-        request (LiveKit's preemptive generation is discarded the same way)."""
+        """The user went on speaking, having begun before any of the reply was audible: re-ask with
+        the whole request (LiveKit's preemptive generation is discarded the same way). If the brain
+        had already begun an answer to the first half, it is told so, and to answer afresh: the
+        "you were cut off at ..." note would invite it to pick the dropped answer up again."""
+        answered = turn.first_text_t is not None
         self.metrics.incr("merged_utterances")
-        self.eventlog.emit("turn_merge", turn_id=turn.id, text=text)
+        self.eventlog.emit("turn_merge", turn_id=turn.id, text=text, answered=answered)
+        note = CONTINUED_NOTE if answered and CONTINUED_NOTE not in turn.context else ""
         await self._cancel_turn(turn, "merged", speak=False, keep_windows=True)
+        self._cut_note = ""
         await self._start_turn(f"{turn.text} {text}", source, origin=turn.origin, transcript_t=t,
-                               context=turn.context, filler=False)
+                               context=_join(turn.context, note), filler=False)
 
     async def _stop_other(self, output: str) -> None:
         assert self.stop_other is not None
@@ -830,7 +892,7 @@ class Orchestrator:
                           context: str = "", filler: bool = True) -> Turn:
         if self.turn is not None:
             await self._cancel_turn(self.turn, "superseded", speak=False)
-        self._cancel_timer("followup")
+        self._end_followup()
         tid = next(self._turn_ids)
         turn = Turn(id=tid, text=text, source=source, output=self._output_for_source(source), origin=origin,
                     segmenter=self.segmenter_factory(), tasks=TaskSet(f"turn{tid}"),
@@ -948,8 +1010,7 @@ class Orchestrator:
                 self._close_windows()
             self._set_state(State.OFF if self.off else State.IDLE, "turn end")
             return
-        asked_question = bool(turn.assistant) and turn.assistant[-1].rstrip().endswith("?")
-        followup_s = self.cfg.listen.followup_after_question_s if asked_question else self.cfg.listen.followup_s
+        followup_s = self.cfg.listen.followup_after_question_s if _asked(turn) else self.cfg.listen.followup_s
         if followup_s > 0 and not self._effective_mute():
             src = self._open_window(turn.source, followup_s, WindowReason.FOLLOWUP)
             if src is not None:
@@ -1000,8 +1061,8 @@ class Orchestrator:
             return
         turn.last_event = time.monotonic()
         k = ev.kind
-        if k in (BrainEventKind.TEXT, BrainEventKind.SAY, BrainEventKind.TOOL_START, BrainEventKind.CONFIRM):
-            turn.output_started = True
+        if k in (BrainEventKind.TOOL_START, BrainEventKind.CONFIRM):
+            turn.acted = True
         if k in (BrainEventKind.TEXT, BrainEventKind.SAY) and turn.first_text_t is None:
             turn.first_text_t = time.monotonic()
             self.metrics.observe_since("brain_first_text", turn.asked_t or turn.started)
@@ -1270,7 +1331,7 @@ class Orchestrator:
         src = self._open_window(source, self.cfg.listen.no_speech_timeout_s, WindowReason.PTT)
         if src is None:
             return None
-        self._cancel_timer("followup")
+        self._end_followup()
         self._play_earcon("listening", self._output_for_source(src))
         if self.turn is None:
             self._set_state(State.LISTENING, "push-to-talk")
@@ -1282,7 +1343,7 @@ class Orchestrator:
             await self._cancel_turn(self.turn, "stop command", speak=False)
             return True
         self.speech.flush_all()
-        self._cancel_timer("followup")
+        self._end_followup()
         if self.state not in (State.IDLE, State.OFF):
             self._set_state(State.IDLE, "stop command")
         return False
@@ -1313,7 +1374,7 @@ class Orchestrator:
             return
         self.off = off
         if off:
-            self._cancel_timer("followup")
+            self._end_followup()
             self.speech.flush_all()
             self._apply_mute()
             self._set_state(State.OFF, "off")
@@ -1407,7 +1468,7 @@ class Orchestrator:
         self.metrics.incr("interrupts")
         self.speech.flush_all()
         await self.reset(hard=True)
-        self._cancel_timer("followup")
+        self._end_followup()
         self._set_state(State.IDLE, "stop everything")
         self._say_system(P.STOPPED_ALL, self._output_for_source(source))
 

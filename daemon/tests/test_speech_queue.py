@@ -241,6 +241,18 @@ async def test_pause_holds_the_remainder_and_resume_plays_it_first(slow) -> None
     assert q.words_heard(1) == 5
 
 
+async def test_on_play_fires_once_across_a_pause(slow) -> None:
+    q, _, out = slow
+    played: list[int] = []
+    q.set_current_turn(1)
+    q.say(1, "first sentence here", "answer", on_play=lambda: played.append(1))
+    await wait_until(lambda: out.play_started)
+    await asyncio.sleep(0.2)
+    assert q.pause() and q.resume()
+    await asyncio.wait_for(q.drain(1), 5)
+    assert played == [1]  # the remainder is the same item: it has played already
+
+
 async def test_pause_ignores_system_speech_and_silence(slow) -> None:
     q, _, out = slow
     assert not q.pause()  # nothing playing

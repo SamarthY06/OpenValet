@@ -232,10 +232,11 @@ class SpeechQueue:
         self._wake.set()
         return True
 
-    def _hold(self, item: SpeechItem, pcm: np.ndarray, sr: int, offset: int) -> None:
+    def _hold(self, item: SpeechItem, pcm: np.ndarray, sr: int, offset: int, *, unplayed: bool = False) -> None:
         total = item.total or (offset + pcm.shape[0])
         self._held = SpeechItem(turn_id=item.turn_id, kind=item.kind, text=item.text, pcm=pcm, sample_rate=sr,
-                                output=item.output, priority=True, offset=item.offset + offset, total=total)
+                                output=item.output, priority=True, offset=item.offset + offset, total=total,
+                                on_play=item.on_play if unplayed else None)  # not heard yet: it still has to say so
         self._pending[item.turn_id] += 1
 
     def _unpause_if(self, pred: Callable[[SpeechItem], bool], reason: str) -> None:
@@ -496,7 +497,7 @@ class SpeechQueue:
             if pcm.size == 0:
                 return
             if self._paused:  # paused while this item was being synthesized: hold all of it
-                self._hold(item, pcm, sr, 0)
+                self._hold(item, pcm, sr, 0, unplayed=True)
                 return
             self._prefetch_next()
             if not self.speaking:

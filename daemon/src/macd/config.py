@@ -66,6 +66,12 @@ class ListenConfig:
     barge_in_onset_ms: int = 300
     barge_in_confirm: bool = True
     barge_in_min_words: int = 3  # Pipecat MinWords default; live test: a misheard "mm-hmm" became "An engine."
+    # How sure the VAD must have been, at its surest, that a sound over Mac's speech is a voice at
+    # the mic. Below that it does not pause Mac (with barge_in_confirm) and its transcript is not
+    # acted on; "stop" is the exception to both. Live 2026-11-24, 331 sounds: the speaker's own
+    # voice always peaked at 0.98 or more; leaked echo and far voices, which STT still turned into
+    # sentences, at 0.91 or less. A sound that began while Mac was silent is not judged. 0 switches it off.
+    barge_in_min_confidence: float = 0.95
 
 
 @dataclass

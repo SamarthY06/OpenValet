@@ -148,8 +148,9 @@ class _Capture:
     probe_gap: int = 0  # voiced frames needed after it before the next probe
     probe_ms: float = 0.0  # wall time spent in probes (diagnostics)
     probe_heard: list[str] = field(default_factory=list)  # what each probe heard, as a category (diagnostics)
+    faint_words: bool = False  # the last probe heard an interruption, in a sound too faint to act on (yet)
     began: str = "onset"  # how it came to be speech over Mac: "onset" (VAD) | "item_start" (Mac spoke into it)
-    over_from: int = 0  # sample index where the speech over Mac began (for pause_after_ms)
+    over_from: int = 0  # sample index from which the user and Mac were both talking (for pause_after_ms)
     pause_at: int | None = None  # sample index of the first BARGE_IN
     frames: int = 0  # frames seen by this segment, and VAD numbers over them (diagnostics)
     voiced: int = 0
@@ -232,6 +233,7 @@ class ListenerImpl:
         self._vad_th = lc.vad_threshold
         self._tail_guard = _samples(lc.tail_guard_ms / 1000)
         self._barge_onset_frames = max(1, round(lc.barge_in_onset_ms / 20))
+        self._barge_conf = lc.barge_in_min_confidence
 
     # ------------------------------------------------------------------ public API
 
@@ -301,6 +303,8 @@ class ListenerImpl:
         c = self._capture
         lc = self._cfg.listen
         probe = False
+        if speaking and not self.speaking and c is not None and c.pause_at is None:
+            c.over_from = self._pos  # Mac was silent until now: the two overlap from here (pause_after_ms)
         if speaking and c is not None and c.speech_seen and self.aec and lc.barge_in and (not c.woke or c.produced_text):
             # Mac starts an item while the user is mid-utterance (live 2026-11-11: Smart Turn kept a
             # thinking pause open, the reply started and talked over them). The capture becomes a
@@ -337,6 +341,14 @@ class ListenerImpl:
         if c.window is not WindowReason.SPEAKING:
             c.began, c.over_from = "item_start", self._pos
         c.window, c.barge, c.woke = WindowReason.SPEAKING, True, False
+
+    def _confident(self, c: _Capture) -> bool:
+        """The VAD has been sure, at least once, that this capture holds a voice at the mic. Echo
+        that leaks through AEC and voices far from the mic stay under it, yet STT still makes
+        sentences of them (live 2026-11-24: a full sentence, close to what Mac had just said). A
+        capture that began while Mac was silent is not judged: it was good enough for the open
+        window, and a quiet speaker must not lose the sentence because the reply started into it."""
+        return c.began == "item_start" or c.prob_max >= self._barge_conf
 
     def _pause(self, c: _Capture) -> None:
         """BARGE_IN, straight onto the queue (not chained behind STT jobs): the pause must be instant."""
@@ -525,15 +537,19 @@ class ListenerImpl:
 
     def _probe_due(self, c: _Capture) -> bool:
         """First probe after barge_in_onset_ms of unbroken speech; after an empty one, only once
-        more voiced audio has arrived (400 ms, then twice as much each time, up to 1.6 s)."""
+        more voiced audio has arrived (400 ms, then twice as much each time, up to 1.6 s), or at once
+        when words were heard in a sound that was faint then and is clearly a voice now."""
         if c.probes == 0:
             return self._speech_run >= self._barge_onset_frames
+        if c.faint_words and self._confident(c):
+            return True  # words were heard while it was faint, and now it is clearly a voice: listen again at once
         return c.voiced - c.probe_voiced >= c.probe_gap
 
     def _start_probe(self, c: _Capture) -> None:
         """Transcribe the capture so far, off the frame path and not behind the chained jobs."""
         audio = _tail(c.parts, _samples(PROBE_AUDIO_S))
         c.probes += 1
+        c.faint_words = False
         c.probe_voiced = c.voiced
         c.probe_gap = PROBE_GAP_MS // FRAME_MS if c.probes == 1 else min(c.probe_gap * 2, PROBE_GAP_MAX_MS // FRAME_MS)
         c.probe_at = c.end + PROBE_DECIDE_FRAMES * FRAME_SAMPLES
@@ -555,7 +571,8 @@ class ListenerImpl:
             c.probe_ms += (time.monotonic() - t0) * 1000
 
     async def _apply_probe(self) -> None:
-        """Act on a finished probe: an interruption (see `_heard`) pauses Mac (BARGE_IN). All of it
+        """Act on a finished probe: an interruption (see `_heard`) pauses Mac (BARGE_IN), from a faint
+        capture (see `_confident`) only if it is a stop word. All of it
         happens here on the frame path, so the capture is only ever changed from one place."""
         c = self._capture
         if c is None or c.probe is None or c.end < c.probe_at:
@@ -577,7 +594,10 @@ class ListenerImpl:
         heard = self._heard(text)
         c.probe_heard.append(heard)
         if heard == "words":
-            self._pause(c)
+            if self._confident(c) or is_stop(text):
+                self._pause(c)
+            else:  # a faint sound pauses Mac for "stop" only, whatever else STT made of it
+                c.faint_words = True
         elif heard == "few":
             c.probe_gap = PROBE_MORE_MS // FRAME_MS  # maybe the start of a sentence ("Can you"): listen again soon
 
@@ -655,8 +675,12 @@ class ListenerImpl:
         audio = np.concatenate(c.parts)[: max(0, keep_to - c.start)]
         same_breath = c.woke and c.hit is not None and not c.capped and c.speech_start - c.hit.sample_index <= _samples(SAME_BREATH_S)
         # (no post-hit speech at all = the command was fused with the wake phrase: same breath)
-        diag = self._capture_numbers(c) if c.window is WindowReason.SPEAKING else None
-        self._enqueue(self._utterance_job(c, audio, time.monotonic(), continuation=c.capped, same_breath=same_breath, diag=diag))
+        faint = c.barge and not self._confident(c)
+        diag = self._capture_numbers(c, faint) if c.window is WindowReason.SPEAKING else None
+        now = time.monotonic()
+        # when the capture began, on the clock: `audio` is trimmed, and a pause that was waited out is not in it
+        self._enqueue(self._utterance_job(c, audio, now, started=now - (c.end - c.start) / SAMPLE_RATE,
+                                          continuation=c.capped, same_breath=same_breath, faint=faint, diag=diag))
         if capped and c.window is not WindowReason.SPEAKING:
             c.restart(self._pos, speaking=True, max_end=self._pos + self._max_utt)
         elif c.woke and self._pos < c.deadline:
@@ -664,13 +688,14 @@ class ListenerImpl:
         else:
             self._capture = None
 
-    def _capture_numbers(self, c: _Capture) -> dict[str, Any]:
+    def _capture_numbers(self, c: _Capture, faint: bool) -> dict[str, Any]:
         """What a finished SPEAKING capture looked like, for the event log (numbers only)."""
         ms = 1000 / SAMPLE_RATE
         return {
             "aec": self.aec,
             "barge": c.barge,
             "paused": c.onset_sent,
+            "faint": faint,
             "began": c.began,
             "capture_ms": round((c.end - c.start) * ms),
             "voiced_ms": c.voiced * FRAME_MS,
@@ -749,8 +774,8 @@ class ListenerImpl:
             log.info("false wake rejected by stage-2 (heard %r)", text)
             self._queue.put_nowait(ListenerEvent(ListenerEventKind.FALSE_WAKE, self.source_name, wake=c.hit))
 
-    async def _utterance_job(self, c: _Capture, audio: np.ndarray, wall_end: float, *, continuation: bool, same_breath: bool,
-                             diag: dict[str, Any] | None = None) -> None:
+    async def _utterance_job(self, c: _Capture, audio: np.ndarray, wall_end: float, *, started: float, continuation: bool,
+                             same_breath: bool, faint: bool = False, diag: dict[str, Any] | None = None) -> None:
         if c.rejected:
             return
         text = await self._transcribe(audio, "listener_stt")
@@ -777,8 +802,8 @@ class ListenerImpl:
         c.produced_text = True
         dur = audio.shape[0] / SAMPLE_RATE
         utt = Utterance(
-            text=text, source=self.source_name, woke=woke, started_at=wall_end - dur, ended_at=wall_end, audio_s=dur,
-            window=c.window, same_breath=woke and same_breath, continuation=continuation,
+            text=text, source=self.source_name, woke=woke, started_at=started, ended_at=wall_end, audio_s=dur,
+            window=c.window, same_breath=woke and same_breath, continuation=continuation, faint=faint,
         )
         self._queue.put_nowait(ListenerEvent(ListenerEventKind.UTTERANCE, self.source_name, utterance=utt, wake=c.hit if woke else None))
         if self._capture is c and not c.speech_seen:
